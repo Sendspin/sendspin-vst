@@ -1,0 +1,30 @@
+[package]
+name = "sendspin-vst3"
+version = "0.2.0"
+edition = "2021"
+authors = ["Sendspin Contributors"]
+description = "Sendspin VST3 plugin"
+license = "MIT OR Apache-2.0"
+
+[workspace]
+members = ["xtask"]
+resolver = "2"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dirs = "5.0"
+mdns-sd = "0.12"
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+parking_lot = "0.12"
+rtrb = "0.3"
+sendspin = { path = "../sendspin-rs" }
+tokio = { version = "1.40", features = ["rt", "sync", "time"] }
+url = "2.5"
+uuid = { version = "1.10", features = ["v4"] }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

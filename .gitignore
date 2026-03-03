@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Rust build outputs
+/target/
+
+# Local validation logs
+/pluginval-logs/
+
+# Editor/temp files
+*.swp
+*.swo
