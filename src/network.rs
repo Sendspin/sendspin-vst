@@ -98,29 +98,17 @@ pub(crate) fn network_thread_main(
 
             let host_sample_rate_hz = shared.host_sample_rate_hz.load(Ordering::Relaxed).max(44_100);
             let player_support = build_player_support(host_sample_rate_hz);
-            let hello = ClientHello {
-                client_id: client_id.clone(),
-                name: active_client_name.clone(),
-                version: 1,
-                supported_roles: vec![
-                    "player@v1".to_string(),
-                    "controller@v1".to_string(),
-                    "metadata@v1".to_string(),
-                ],
-                device_info: Some(DeviceInfo {
-                    product_name: Some(PRODUCT_NAME.to_string()),
-                    manufacturer: Some("Sendspin".to_string()),
-                    software_version: Some(EFFECTIVE_PLUGIN_VERSION.to_string()),
-                }),
-                player_v1_support: Some(player_support),
-                artwork_v1_support: None,
-                visualizer_v1_support: None,
-            };
+            let hello = build_client_hello(
+                &client_id,
+                &active_client_name,
+                player_support,
+                ClientRoleMode::Extended,
+            );
 
             let Some(connect_url) = active_server_url.as_ref() else {
                 continue;
             };
-            let client = match ProtocolClient::connect(connect_url, hello).await {
+            let client = match connect_with_fallback(connect_url, hello, &client_id, &active_client_name).await {
                 Ok(client) => client,
                 Err(_) => {
                     shared.set_connection_state(ConnectionState::Error);
@@ -271,6 +259,72 @@ pub(crate) fn network_thread_main(
             }
         }
     });
+}
+
+#[derive(Clone, Copy)]
+enum ClientRoleMode {
+    PlayerOnly,
+    Extended,
+}
+
+fn build_client_hello(
+    client_id: &str,
+    client_name: &str,
+    player_support: PlayerV1Support,
+    role_mode: ClientRoleMode,
+) -> ClientHello {
+    let supported_roles = match role_mode {
+        ClientRoleMode::PlayerOnly => vec!["player@v1".to_string()],
+        ClientRoleMode::Extended => vec![
+            "player@v1".to_string(),
+            "controller@v1".to_string(),
+            "metadata@v1".to_string(),
+        ],
+    };
+
+    ClientHello {
+        client_id: client_id.to_string(),
+        name: client_name.to_string(),
+        version: 1,
+        supported_roles,
+        device_info: Some(DeviceInfo {
+            product_name: Some(PRODUCT_NAME.to_string()),
+            manufacturer: Some("Sendspin".to_string()),
+            software_version: Some(EFFECTIVE_PLUGIN_VERSION.to_string()),
+        }),
+        player_v1_support: Some(player_support),
+        artwork_v1_support: None,
+        visualizer_v1_support: None,
+    }
+}
+
+async fn connect_with_fallback(
+    connect_url: &str,
+    hello: ClientHello,
+    client_id: &str,
+    client_name: &str,
+) -> Result<ProtocolClient, sendspin::error::Error> {
+    match ProtocolClient::connect(connect_url, hello).await {
+        Ok(client) => Ok(client),
+        Err(err) => {
+            if !should_retry_with_player_only(&err) {
+                return Err(err);
+            }
+
+            let fallback_hello = build_client_hello(
+                client_id,
+                client_name,
+                build_compat_player_support(),
+                ClientRoleMode::PlayerOnly,
+            );
+            ProtocolClient::connect(connect_url, fallback_hello).await
+        }
+    }
+}
+
+fn should_retry_with_player_only(err: &sendspin::error::Error) -> bool {
+    let message = err.to_string();
+    message.contains("Expected server/hello")
 }
 
 async fn handle_message(
@@ -471,6 +525,28 @@ fn build_player_support(host_sample_rate_hz: u32) -> PlayerV1Support {
     }
 }
 
+fn build_compat_player_support() -> PlayerV1Support {
+    PlayerV1Support {
+        supported_formats: vec![
+            AudioFormatSpec {
+                codec: "pcm".to_string(),
+                channels: 2,
+                sample_rate: 48_000,
+                bit_depth: 24,
+            },
+            AudioFormatSpec {
+                codec: "pcm".to_string(),
+                channels: 2,
+                sample_rate: 48_000,
+                bit_depth: 16,
+            },
+        ],
+        // Match ProtocolClientBuilder defaults for broad server compatibility.
+        buffer_capacity: 50 * 1024 * 1024,
+        supported_commands: vec!["volume".to_string(), "mute".to_string()],
+    }
+}
+
 async fn request_pcm_format(
     ws_tx: &WsSender,
     sample_rate_hz: u32,
@@ -571,7 +647,20 @@ fn unix_time_micros() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_pcm_samples;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use rtrb::RingBuffer;
+    use tokio::sync::mpsc::unbounded_channel;
+    use uuid::Uuid;
+
+    use super::{
+        build_client_hello, build_player_support, connect_with_fallback, decode_pcm_samples,
+        network_thread_main, ClientRoleMode,
+    };
+    use crate::state::{ConnectionState, SharedState, TimestampedChunk, WorkerCommand};
 
     #[test]
     fn decode_pcm_16() {
@@ -590,5 +679,86 @@ mod tests {
     fn decode_pcm_rejects_frame_mismatch() {
         let bytes = [0_u8; 6];
         assert!(decode_pcm_samples(&bytes, 4, 16).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires a running Sendspin server (set SENDSPIN_SMOKE_SERVER_URL)"]
+    fn live_smoke_connects_to_sendspin_server() {
+        let server_url = std::env::var("SENDSPIN_SMOKE_SERVER_URL")
+            .unwrap_or_else(|_| "ws://127.0.0.1:8927/sendspin".to_string());
+
+        let shared = Arc::new(SharedState::new());
+        let (chunk_producer, _chunk_consumer) = RingBuffer::<TimestampedChunk>::new(16);
+        let (command_tx, command_rx) = unbounded_channel();
+        let shared_for_thread = Arc::clone(&shared);
+        let client_id = Uuid::new_v4().to_string();
+
+        let join_handle = thread::spawn(move || {
+            network_thread_main(
+                shared_for_thread,
+                chunk_producer,
+                command_rx,
+                server_url,
+                "Sendspin VST Smoke".to_string(),
+                client_id,
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if shared.connection_state() == ConnectionState::Connected {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        assert_eq!(
+            shared.connection_state(),
+            ConnectionState::Connected,
+            "worker never reached connected state"
+        );
+
+        assert!(
+            command_tx.send(WorkerCommand::Shutdown).is_ok(),
+            "failed to send worker shutdown command"
+        );
+        assert!(join_handle.join().is_ok(), "failed joining network worker");
+        assert!(
+            !shared.stream_active.load(Ordering::Relaxed),
+            "stream should be inactive after shutdown"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a running Sendspin server (set SENDSPIN_SMOKE_SERVER_URL)"]
+    fn live_protocol_client_connects() {
+        let server_url = std::env::var("SENDSPIN_SMOKE_SERVER_URL")
+            .unwrap_or_else(|_| "ws://127.0.0.1:8927/sendspin".to_string());
+        let client_id = Uuid::new_v4().to_string();
+
+        let hello = build_client_hello(
+            &client_id,
+            "Sendspin VST Handshake Test",
+            build_player_support(48_000),
+            ClientRoleMode::Extended,
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build runtime");
+
+        let result = runtime.block_on(async {
+            connect_with_fallback(
+                &server_url,
+                hello,
+                &client_id,
+                "Sendspin VST Handshake Test",
+            )
+            .await
+        });
+        if let Err(err) = result {
+            panic!("ProtocolClient::connect failed: {err}");
+        }
     }
 }
