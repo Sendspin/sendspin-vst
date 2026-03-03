@@ -215,7 +215,12 @@ pub(crate) fn network_thread_main(
 
                         if let Some(stream) = active_stream.as_ref() {
                             if let Some(decoded_chunk) = decode_audio_chunk(&chunk, stream, &clock_sync) {
-                                let _ = chunk_producer.push(decoded_chunk);
+                                if chunk_producer.push(decoded_chunk).is_err() {
+                                    shared.record_queue_overflow();
+                                    shared.set_sync_state(SyncState::Error);
+                                }
+                            } else {
+                                shared.record_decode_error();
                             }
                         }
                     }
@@ -287,6 +292,7 @@ async fn handle_message(
 
             if player.codec != "pcm"
                 || player.sample_rate != host_sample_rate_hz
+                || !matches!(player.channels, 1 | 2)
                 || !matches!(player.bit_depth, 16 | 24)
             {
                 let _ = request_pcm_format(ws_tx, host_sample_rate_hz).await;
@@ -367,7 +373,7 @@ fn decode_audio_chunk(
     stream: &ActiveStream,
     clock_sync: &Arc<parking_lot::Mutex<sendspin::sync::ClockSync>>,
 ) -> Option<TimestampedChunk> {
-    if stream.codec != "pcm" || stream.channels == 0 {
+    if stream.codec != "pcm" || !matches!(stream.channels, 1 | 2) {
         return None;
     }
 

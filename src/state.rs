@@ -86,6 +86,13 @@ pub(crate) struct DiscoveredServer {
     pub(crate) url: String,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DiagnosticsSnapshot {
+    pub(crate) queue_overflow_count: u32,
+    pub(crate) decode_error_count: u32,
+    pub(crate) late_chunk_count: u32,
+}
+
 #[derive(Debug)]
 pub(crate) struct SharedState {
     pub(crate) host_sample_rate_hz: AtomicU32,
@@ -103,6 +110,9 @@ pub(crate) struct SharedState {
     now_playing_artist: RwLock<String>,
     now_playing_title: RwLock<String>,
     discovered_servers: RwLock<Vec<DiscoveredServer>>,
+    queue_overflow_count: AtomicU32,
+    decode_error_count: AtomicU32,
+    late_chunk_count: AtomicU32,
     worker_command_tx: Mutex<Option<UnboundedSender<WorkerCommand>>>,
     mdns_command_tx: Mutex<Option<StdSender<MdnsCommand>>>,
 }
@@ -125,6 +135,9 @@ impl SharedState {
             now_playing_artist: RwLock::new(String::new()),
             now_playing_title: RwLock::new(String::new()),
             discovered_servers: RwLock::new(Vec::new()),
+            queue_overflow_count: AtomicU32::new(0),
+            decode_error_count: AtomicU32::new(0),
+            late_chunk_count: AtomicU32::new(0),
             worker_command_tx: Mutex::new(None),
             mdns_command_tx: Mutex::new(None),
         }
@@ -258,6 +271,26 @@ impl SharedState {
             let _ = tx.send(MdnsCommand::Refresh);
         }
     }
+
+    pub(crate) fn record_queue_overflow(&self) {
+        self.queue_overflow_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_decode_error(&self) {
+        self.decode_error_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_late_chunk(&self) {
+        self.late_chunk_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn diagnostics_snapshot(&self) -> DiagnosticsSnapshot {
+        DiagnosticsSnapshot {
+            queue_overflow_count: self.queue_overflow_count.load(Ordering::Relaxed),
+            decode_error_count: self.decode_error_count.load(Ordering::Relaxed),
+            late_chunk_count: self.late_chunk_count.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -334,5 +367,31 @@ impl MdnsWorker {
         if let Some(join_handle) = self.join_handle.take() {
             let _ = join_handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SharedState, SyncState};
+
+    #[test]
+    fn diagnostics_counters_increment() {
+        let shared = SharedState::new();
+        shared.record_queue_overflow();
+        shared.record_decode_error();
+        shared.record_late_chunk();
+        shared.record_late_chunk();
+
+        let snapshot = shared.diagnostics_snapshot();
+        assert_eq!(snapshot.queue_overflow_count, 1);
+        assert_eq!(snapshot.decode_error_count, 1);
+        assert_eq!(snapshot.late_chunk_count, 2);
+    }
+
+    #[test]
+    fn sync_state_unknown_defaults_to_synchronized() {
+        assert_eq!(SyncState::from_u8(0), SyncState::Synchronized);
+        assert_eq!(SyncState::from_u8(99), SyncState::Synchronized);
+        assert_eq!(SyncState::from_u8(1), SyncState::Error);
     }
 }

@@ -22,7 +22,8 @@ use config::{
 };
 use constants::{
     CHUNK_QUEUE_CAPACITY, EFFECTIVE_PLUGIN_VERSION, PIPELINE_OFFSET_MAX_MS, PIPELINE_OFFSET_MIN_MS,
-    PIPELINE_OFFSET_STEP_MS, RENDER_CLOCK_REANCHOR_THRESHOLD_US, TIMING_JITTER_TOLERANCE_US,
+    PIPELINE_OFFSET_STEP_MS, RECOVERY_SYNC_THRESHOLD_BLOCKS, RENDER_CLOCK_REANCHOR_THRESHOLD_US,
+    TIMING_JITTER_TOLERANCE_US, UNDERRUN_ERROR_THRESHOLD_BLOCKS,
 };
 use mdns::mdns_thread_main;
 use network::network_thread_main;
@@ -116,6 +117,8 @@ pub struct SendspinVst3 {
     sample_rate_hz: u32,
     render_cursor_us: Option<i64>,
     time_anchor: TimeAnchor,
+    underrun_streak_blocks: u32,
+    recovery_streak_blocks: u32,
 }
 
 impl Default for SendspinVst3 {
@@ -133,6 +136,8 @@ impl Default for SendspinVst3 {
             sample_rate_hz: 48_000,
             render_cursor_us: None,
             time_anchor: TimeAnchor::capture_now(),
+            underrun_streak_blocks: 0,
+            recovery_streak_blocks: 0,
         }
     }
 }
@@ -198,6 +203,8 @@ impl SendspinVst3 {
     fn clear_audio_queue(&mut self) {
         self.active_chunk = None;
         self.render_cursor_us = None;
+        self.underrun_streak_blocks = 0;
+        self.recovery_streak_blocks = 0;
         while self.chunk_consumer.pop().is_ok() {}
     }
 
@@ -225,8 +232,10 @@ impl SendspinVst3 {
                 };
 
                 if active.chunk.sample_rate_hz != host_sample_rate_hz {
+                    self.shared.record_late_chunk();
                     true
                 } else {
+                    let mut drop_for_late_start = false;
                     if !active.started {
                         let delta_us = sample_time_us - active.chunk.local_play_time_us;
                         if delta_us < -TIMING_JITTER_TOLERANCE_US {
@@ -240,11 +249,16 @@ impl SendspinVst3 {
                         };
                         let skipped_frames = ((adjusted_delta_us * i64::from(host_sample_rate_hz))
                             / 1_000_000) as usize;
-                        active.next_frame_index = skipped_frames;
-                        active.started = true;
+                        if skipped_frames >= active.chunk.frame_count {
+                            self.shared.record_late_chunk();
+                            drop_for_late_start = true;
+                        } else {
+                            active.next_frame_index = skipped_frames;
+                            active.started = true;
+                        }
                     }
 
-                    if active.next_frame_index >= active.chunk.frame_count {
+                    if drop_for_late_start || active.next_frame_index >= active.chunk.frame_count {
                         true
                     } else {
                         let base = active.next_frame_index * active.chunk.channels;
@@ -264,6 +278,33 @@ impl SendspinVst3 {
                 self.active_chunk = None;
                 continue;
             }
+        }
+    }
+
+    fn update_sync_state_for_block(&mut self, received_any_frame: bool) {
+        if self.shared.stream_active.load(Ordering::Relaxed) {
+            if received_any_frame {
+                self.underrun_streak_blocks = 0;
+                self.recovery_streak_blocks = self.recovery_streak_blocks.saturating_add(1);
+
+                if self.shared.sync_state() == SyncState::Error {
+                    if self.recovery_streak_blocks >= RECOVERY_SYNC_THRESHOLD_BLOCKS {
+                        self.shared.set_sync_state(SyncState::Synchronized);
+                        self.recovery_streak_blocks = 0;
+                    }
+                } else {
+                    self.shared.set_sync_state(SyncState::Synchronized);
+                }
+            } else {
+                self.recovery_streak_blocks = 0;
+                self.underrun_streak_blocks = self.underrun_streak_blocks.saturating_add(1);
+                if self.underrun_streak_blocks >= UNDERRUN_ERROR_THRESHOLD_BLOCKS {
+                    self.shared.set_sync_state(SyncState::Error);
+                }
+            }
+        } else {
+            self.underrun_streak_blocks = 0;
+            self.recovery_streak_blocks = 0;
         }
     }
 }
@@ -349,6 +390,7 @@ impl Plugin for SendspinVst3 {
                 let connection_state = shared.connection_state();
                 let playback_state = shared.group_playback_state();
                 let (now_playing_artist, now_playing_title) = shared.now_playing();
+                let diagnostics = shared.diagnostics_snapshot();
                 let now_playing_label =
                     match (now_playing_artist.is_empty(), now_playing_title.is_empty()) {
                         (true, true) => "Now playing: (metadata unavailable)".to_string(),
@@ -381,6 +423,12 @@ impl Plugin for SendspinVst3 {
                     ui.label(format!("Connection: {}", connection_state.as_str()));
                     ui.label(format!("Client Name: {}", configured_client_name));
                     ui.label(format!("Server URL: {}", configured_url));
+                    ui.label(format!(
+                        "Diagnostics: queue_overflow={} decode_error={} late_chunk={}",
+                        diagnostics.queue_overflow_count,
+                        diagnostics.decode_error_count,
+                        diagnostics.late_chunk_count
+                    ));
                     ui.horizontal_wrapped(|ui| {
                         let toggle_label = if playback_state == GroupPlaybackState::Playing {
                             "Pause"
@@ -662,13 +710,7 @@ impl Plugin for SendspinVst3 {
             }
         }
 
-        if self.shared.stream_active.load(Ordering::Relaxed) {
-            if received_any_frame {
-                self.shared.set_sync_state(SyncState::Synchronized);
-            } else {
-                self.shared.set_sync_state(SyncState::Error);
-            }
-        }
+        self.update_sync_state_for_block(received_any_frame);
 
         ProcessStatus::Normal
     }
@@ -697,4 +739,34 @@ fn unix_time_micros() -> i64 {
     };
 
     duration_since_epoch.as_micros() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SendspinVst3, SyncState, RECOVERY_SYNC_THRESHOLD_BLOCKS, UNDERRUN_ERROR_THRESHOLD_BLOCKS,
+    };
+
+    #[test]
+    fn sync_state_hysteresis_resists_flapping() {
+        let mut plugin = SendspinVst3::default();
+        plugin.shared.set_stream_active(true);
+        plugin.shared.set_sync_state(SyncState::Synchronized);
+
+        for _ in 0..(UNDERRUN_ERROR_THRESHOLD_BLOCKS - 1) {
+            plugin.update_sync_state_for_block(false);
+            assert_eq!(plugin.shared.sync_state(), SyncState::Synchronized);
+        }
+
+        plugin.update_sync_state_for_block(false);
+        assert_eq!(plugin.shared.sync_state(), SyncState::Error);
+
+        for _ in 0..(RECOVERY_SYNC_THRESHOLD_BLOCKS - 1) {
+            plugin.update_sync_state_for_block(true);
+            assert_eq!(plugin.shared.sync_state(), SyncState::Error);
+        }
+
+        plugin.update_sync_state_for_block(true);
+        assert_eq!(plugin.shared.sync_state(), SyncState::Synchronized);
+    }
 }

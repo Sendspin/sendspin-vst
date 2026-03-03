@@ -14,3 +14,5 @@ pub(crate) const PREFERRED_PCM_BIT_DEPTH: u8 = 24;
 pub(crate) const PIPELINE_OFFSET_MIN_MS: i32 = -100;
 pub(crate) const PIPELINE_OFFSET_MAX_MS: i32 = 200;
 pub(crate) const PIPELINE_OFFSET_STEP_MS: i32 = 1;
+pub(crate) const UNDERRUN_ERROR_THRESHOLD_BLOCKS: u32 = 3;
+pub(crate) const RECOVERY_SYNC_THRESHOLD_BLOCKS: u32 = 4;
