@@ -25,6 +25,7 @@ Server URL can be configured in the plugin GUI:
 - Pick a discovered server from mDNS
 - Choose `Other...` and enter a custom URL
 - Click `Refresh` to re-query mDNS
+- Set a custom client name and click `Apply Name`
 
 URL normalization rules:
 
@@ -36,6 +37,11 @@ Default URL comes from:
 
 - `SENDSPIN_SERVER_URL` (if valid)
 - otherwise `ws://127.0.0.1:8927/sendspin`
+
+Default client name comes from:
+
+- `SENDSPIN_CLIENT_NAME` (if set and valid)
+- otherwise `Sendspin VST`
 
 A persistent `client_id` UUID is stored under your user config directory:
 

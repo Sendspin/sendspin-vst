@@ -26,7 +26,7 @@ use uuid::Uuid;
 const DEFAULT_SERVER_URL: &str = "ws://127.0.0.1:8927/sendspin";
 const DEFAULT_SERVER_PATH: &str = "/sendspin";
 const SENDSPIN_SERVER_SERVICE_TYPE: &str = "_sendspin-server._tcp.local.";
-const CLIENT_NAME: &str = "Sendspin VST3";
+const DEFAULT_CLIENT_NAME: &str = "Sendspin VST";
 const PRODUCT_NAME: &str = "Sendspin VST3";
 const BUFFER_CAPACITY_BYTES: u32 = 1_048_576;
 const CHUNK_QUEUE_CAPACITY: usize = 512;
@@ -106,6 +106,7 @@ struct SharedState {
     connection_state: AtomicU8,
     state_dirty: AtomicBool,
     configured_server_url: RwLock<String>,
+    configured_client_name: RwLock<String>,
     discovered_servers: RwLock<Vec<DiscoveredServer>>,
     worker_command_tx: Mutex<Option<UnboundedSender<WorkerCommand>>>,
     mdns_command_tx: Mutex<Option<StdSender<MdnsCommand>>>,
@@ -124,6 +125,7 @@ impl SharedState {
             connection_state: AtomicU8::new(ConnectionState::Disconnected as u8),
             state_dirty: AtomicBool::new(true),
             configured_server_url: RwLock::new(default_server_url()),
+            configured_client_name: RwLock::new(default_client_name()),
             discovered_servers: RwLock::new(Vec::new()),
             worker_command_tx: Mutex::new(None),
             mdns_command_tx: Mutex::new(None),
@@ -177,6 +179,14 @@ impl SharedState {
         self.configured_server_url.read().clone()
     }
 
+    fn set_configured_client_name(&self, name: String) {
+        *self.configured_client_name.write() = name;
+    }
+
+    fn configured_client_name(&self) -> String {
+        self.configured_client_name.read().clone()
+    }
+
     fn set_discovered_servers(&self, servers: Vec<DiscoveredServer>) {
         *self.discovered_servers.write() = servers;
     }
@@ -197,6 +207,13 @@ impl SharedState {
         self.set_configured_server_url(url.clone());
         if let Some(tx) = self.worker_command_tx.lock().as_ref() {
             let _ = tx.send(WorkerCommand::SetServerUrl(url));
+        }
+    }
+
+    fn request_client_name_switch(&self, client_name: String) {
+        self.set_configured_client_name(client_name.clone());
+        if let Some(tx) = self.worker_command_tx.lock().as_ref() {
+            let _ = tx.send(WorkerCommand::SetClientName(client_name));
         }
     }
 
@@ -234,6 +251,7 @@ struct ActiveStream {
 enum WorkerCommand {
     Shutdown,
     SetServerUrl(String),
+    SetClientName(String),
 }
 
 enum MdnsCommand {
@@ -274,6 +292,9 @@ struct SendspinVst3Params {
     #[persist = "editor-state"]
     editor_state: Arc<EguiState>,
 
+    #[persist = "client-name"]
+    client_name: Arc<Mutex<String>>,
+
     #[persist = "server-url"]
     server_url: Arc<Mutex<String>>,
 
@@ -291,6 +312,7 @@ impl Default for SendspinVst3Params {
     fn default() -> Self {
         Self {
             editor_state: EguiState::from_size(560, 320),
+            client_name: Arc::new(Mutex::new(default_client_name())),
             server_url: Arc::new(Mutex::new(default_server_url())),
             volume: FloatParam::new("Volume", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
                 .with_unit(""),
@@ -380,12 +402,20 @@ impl SendspinVst3 {
 
         let shared = Arc::clone(&self.shared);
         let server_url = self.shared.configured_server_url();
+        let client_name = self.shared.configured_client_name();
         let client_id = load_or_create_client_id();
         let (command_tx, command_rx) = unbounded_channel();
         self.shared.set_worker_command_tx(command_tx.clone());
 
         let join_handle = thread::spawn(move || {
-            network_thread_main(shared, chunk_producer, command_rx, server_url, client_id);
+            network_thread_main(
+                shared,
+                chunk_producer,
+                command_rx,
+                server_url,
+                client_name,
+                client_id,
+            );
         });
 
         self.worker = Some(NetworkWorker {
@@ -469,9 +499,21 @@ impl SendspinVst3 {
 
 #[derive(Debug, Default)]
 struct EditorUiState {
+    client_name_input: String,
     use_custom_url: bool,
     custom_url_input: String,
     last_message: String,
+}
+
+fn apply_client_name_selection(
+    params: &Arc<SendspinVst3Params>,
+    shared: &Arc<SharedState>,
+    raw_name: &str,
+) -> Result<String, &'static str> {
+    let normalized = normalize_client_name(raw_name).ok_or("Client name cannot be empty")?;
+    *params.client_name.lock() = normalized.clone();
+    shared.request_client_name_switch(normalized.clone());
+    Ok(normalized)
 }
 
 fn apply_server_url_selection(
@@ -521,8 +563,12 @@ impl Plugin for SendspinVst3 {
             move |egui_ctx, _setter, state| {
                 let discovered_servers = shared.discovered_servers();
                 let configured_url = shared.configured_server_url();
+                let configured_client_name = shared.configured_client_name();
                 if state.custom_url_input.is_empty() {
                     state.custom_url_input = configured_url.clone();
+                }
+                if state.client_name_input.is_empty() {
+                    state.client_name_input = configured_client_name.clone();
                 }
 
                 if !discovered_servers
@@ -540,7 +586,30 @@ impl Plugin for SendspinVst3 {
                         "Connection: {}",
                         shared.connection_state().as_str()
                     ));
+                    ui.label(format!("Client Name: {}", configured_client_name));
                     ui.label(format!("Server URL: {}", configured_url));
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        ui.label("Client name:");
+                        ui.text_edit_singleline(&mut state.client_name_input);
+                        if ui.button("Apply Name").clicked() {
+                            match apply_client_name_selection(
+                                &params,
+                                &shared,
+                                &state.client_name_input,
+                            ) {
+                                Ok(applied_name) => {
+                                    state.client_name_input = applied_name;
+                                    state.last_message =
+                                        "Applying client name and reconnecting...".to_string();
+                                }
+                                Err(err) => {
+                                    state.last_message = err.to_string();
+                                }
+                            }
+                        }
+                    });
                     ui.separator();
 
                     ui.horizontal(|ui| {
@@ -646,6 +715,12 @@ impl Plugin for SendspinVst3 {
             .host_block_size
             .store(buffer_config.max_buffer_size as u32, Ordering::Relaxed);
         self.render_cursor_us = None;
+        let saved_client_name = self.params.client_name.lock().clone();
+        let configured_client_name =
+            normalize_client_name(&saved_client_name).unwrap_or_else(default_client_name);
+        *self.params.client_name.lock() = configured_client_name.clone();
+        self.shared
+            .set_configured_client_name(configured_client_name);
         let saved_server_url = self.params.server_url.lock().clone();
         let configured_server_url =
             normalize_server_url(&saved_server_url).unwrap_or_else(default_server_url);
@@ -763,6 +838,7 @@ fn network_thread_main(
     mut chunk_producer: Producer<TimestampedChunk>,
     mut command_rx: UnboundedReceiver<WorkerCommand>,
     server_url: String,
+    client_name: String,
     client_id: String,
 ) {
     let runtime = TokioRuntimeBuilder::new_current_thread()
@@ -777,7 +853,10 @@ fn network_thread_main(
     runtime.block_on(async move {
         let mut reconnect_delay = Duration::from_secs(1);
         let mut active_server_url = normalize_server_url(&server_url).unwrap_or_else(default_server_url);
+        let mut active_client_name =
+            normalize_client_name(&client_name).unwrap_or_else(default_client_name);
         shared.set_configured_server_url(active_server_url.clone());
+        shared.set_configured_client_name(active_client_name.clone());
 
         'outer: loop {
             loop {
@@ -787,6 +866,13 @@ fn network_thread_main(
                         if let Some(normalized) = normalize_server_url(&new_url) {
                             active_server_url = normalized.clone();
                             shared.set_configured_server_url(normalized);
+                            reconnect_delay = Duration::from_millis(100);
+                        }
+                    }
+                    Ok(WorkerCommand::SetClientName(new_client_name)) => {
+                        if let Some(normalized) = normalize_client_name(&new_client_name) {
+                            active_client_name = normalized.clone();
+                            shared.set_configured_client_name(normalized);
                             reconnect_delay = Duration::from_millis(100);
                         }
                     }
@@ -802,7 +888,7 @@ fn network_thread_main(
 
             let builder = ProtocolClientBuilder::builder()
                 .client_id(client_id.clone())
-                .name(CLIENT_NAME.to_string())
+                .name(active_client_name.clone())
                 .product_name(Some(PRODUCT_NAME.to_string()))
                 .software_version(Some(env!("CARGO_PKG_VERSION").to_string()))
                 .player_v1_support(player_support)
@@ -821,6 +907,12 @@ fn network_thread_main(
                         ReconnectAction::UpdateServerUrl(new_url) => {
                             active_server_url = new_url.clone();
                             shared.set_configured_server_url(new_url);
+                            reconnect_delay = Duration::from_millis(100);
+                            continue;
+                        }
+                        ReconnectAction::UpdateClientName(new_client_name) => {
+                            active_client_name = new_client_name.clone();
+                            shared.set_configured_client_name(new_client_name);
                             reconnect_delay = Duration::from_millis(100);
                             continue;
                         }
@@ -857,6 +949,16 @@ fn network_thread_main(
                                     if normalized != active_server_url {
                                         active_server_url = normalized.clone();
                                         shared.set_configured_server_url(normalized);
+                                        reconnect_immediately = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            Some(WorkerCommand::SetClientName(new_client_name)) => {
+                                if let Some(normalized) = normalize_client_name(&new_client_name) {
+                                    if normalized != active_client_name {
+                                        active_client_name = normalized.clone();
+                                        shared.set_configured_client_name(normalized);
                                         reconnect_immediately = true;
                                         break;
                                     }
@@ -921,6 +1023,11 @@ fn network_thread_main(
                 ReconnectAction::UpdateServerUrl(new_url) => {
                     active_server_url = new_url.clone();
                     shared.set_configured_server_url(new_url);
+                    reconnect_delay = Duration::from_millis(100);
+                }
+                ReconnectAction::UpdateClientName(new_client_name) => {
+                    active_client_name = new_client_name.clone();
+                    shared.set_configured_client_name(new_client_name);
                     reconnect_delay = Duration::from_millis(100);
                 }
             }
@@ -1150,6 +1257,7 @@ enum ReconnectAction {
     Continue,
     Stop,
     UpdateServerUrl(String),
+    UpdateClientName(String),
 }
 
 async fn wait_reconnect_or_command(
@@ -1167,6 +1275,12 @@ async fn wait_reconnect_or_command(
                         None => ReconnectAction::Continue,
                     }
                 }
+                Some(WorkerCommand::SetClientName(new_client_name)) => {
+                    match normalize_client_name(&new_client_name) {
+                        Some(normalized) => ReconnectAction::UpdateClientName(normalized),
+                        None => ReconnectAction::Continue,
+                    }
+                }
             }
         }
     }
@@ -1180,6 +1294,32 @@ fn default_server_url() -> String {
     }
 
     DEFAULT_SERVER_URL.to_string()
+}
+
+fn default_client_name() -> String {
+    if let Ok(value) = std::env::var("SENDSPIN_CLIENT_NAME") {
+        if let Some(normalized) = normalize_client_name(&value) {
+            return normalized;
+        }
+    }
+
+    DEFAULT_CLIENT_NAME.to_string()
+}
+
+fn normalize_client_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Keep the wire payload bounded and readable.
+    let max_chars = 80;
+    let normalized: String = trimmed.chars().take(max_chars).collect();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    Some(normalized)
 }
 
 fn normalize_server_url(raw: &str) -> Option<String> {
