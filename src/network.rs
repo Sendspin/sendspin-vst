@@ -98,12 +98,17 @@ pub(crate) fn network_thread_main(
 
             let host_sample_rate_hz = shared.host_sample_rate_hz.load(Ordering::Relaxed).max(44_100);
             let player_support = build_player_support(host_sample_rate_hz);
-            let hello = build_client_hello(&client_id, &active_client_name, player_support);
+            let hello = build_client_hello(
+                &client_id,
+                &active_client_name,
+                player_support,
+                ClientRoleMode::Extended,
+            );
 
             let Some(connect_url) = active_server_url.as_ref() else {
                 continue;
             };
-            let client = match ProtocolClient::connect(connect_url, hello).await {
+            let client = match connect_with_fallback(connect_url, hello, &client_id, &active_client_name).await {
                 Ok(client) => client,
                 Err(_) => {
                     shared.set_connection_state(ConnectionState::Error);
@@ -256,20 +261,32 @@ pub(crate) fn network_thread_main(
     });
 }
 
+#[derive(Clone, Copy)]
+enum ClientRoleMode {
+    PlayerOnly,
+    Extended,
+}
+
 fn build_client_hello(
     client_id: &str,
     client_name: &str,
     player_support: PlayerV1Support,
+    role_mode: ClientRoleMode,
 ) -> ClientHello {
-    ClientHello {
-        client_id: client_id.to_string(),
-        name: client_name.to_string(),
-        version: 1,
-        supported_roles: vec![
+    let supported_roles = match role_mode {
+        ClientRoleMode::PlayerOnly => vec!["player@v1".to_string()],
+        ClientRoleMode::Extended => vec![
             "player@v1".to_string(),
             "controller@v1".to_string(),
             "metadata@v1".to_string(),
         ],
+    };
+
+    ClientHello {
+        client_id: client_id.to_string(),
+        name: client_name.to_string(),
+        version: 1,
+        supported_roles,
         device_info: Some(DeviceInfo {
             product_name: Some(PRODUCT_NAME.to_string()),
             manufacturer: Some("Sendspin".to_string()),
@@ -279,6 +296,35 @@ fn build_client_hello(
         artwork_v1_support: None,
         visualizer_v1_support: None,
     }
+}
+
+async fn connect_with_fallback(
+    connect_url: &str,
+    hello: ClientHello,
+    client_id: &str,
+    client_name: &str,
+) -> Result<ProtocolClient, sendspin::error::Error> {
+    match ProtocolClient::connect(connect_url, hello).await {
+        Ok(client) => Ok(client),
+        Err(err) => {
+            if !should_retry_with_player_only(&err) {
+                return Err(err);
+            }
+
+            let fallback_hello = build_client_hello(
+                client_id,
+                client_name,
+                build_compat_player_support(),
+                ClientRoleMode::PlayerOnly,
+            );
+            ProtocolClient::connect(connect_url, fallback_hello).await
+        }
+    }
+}
+
+fn should_retry_with_player_only(err: &sendspin::error::Error) -> bool {
+    let message = err.to_string();
+    message.contains("Expected server/hello")
 }
 
 async fn handle_message(
@@ -479,6 +525,28 @@ fn build_player_support(host_sample_rate_hz: u32) -> PlayerV1Support {
     }
 }
 
+fn build_compat_player_support() -> PlayerV1Support {
+    PlayerV1Support {
+        supported_formats: vec![
+            AudioFormatSpec {
+                codec: "pcm".to_string(),
+                channels: 2,
+                sample_rate: 48_000,
+                bit_depth: 24,
+            },
+            AudioFormatSpec {
+                codec: "pcm".to_string(),
+                channels: 2,
+                sample_rate: 48_000,
+                bit_depth: 16,
+            },
+        ],
+        // Match ProtocolClientBuilder defaults for broad server compatibility.
+        buffer_capacity: 50 * 1024 * 1024,
+        supported_commands: vec!["volume".to_string(), "mute".to_string()],
+    }
+}
+
 async fn request_pcm_format(
     ws_tx: &WsSender,
     sample_rate_hz: u32,
@@ -585,12 +653,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use rtrb::RingBuffer;
-    use sendspin::ProtocolClient;
     use tokio::sync::mpsc::unbounded_channel;
     use uuid::Uuid;
 
     use super::{
-        build_client_hello, build_player_support, decode_pcm_samples, network_thread_main,
+        build_client_hello, build_player_support, connect_with_fallback, decode_pcm_samples,
+        network_thread_main, ClientRoleMode,
     };
     use crate::state::{ConnectionState, SharedState, TimestampedChunk, WorkerCommand};
 
@@ -672,6 +740,7 @@ mod tests {
             &client_id,
             "Sendspin VST Handshake Test",
             build_player_support(48_000),
+            ClientRoleMode::Extended,
         );
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -679,7 +748,15 @@ mod tests {
             .build()
             .expect("failed to build runtime");
 
-        let result = runtime.block_on(async { ProtocolClient::connect(&server_url, hello).await });
+        let result = runtime.block_on(async {
+            connect_with_fallback(
+                &server_url,
+                hello,
+                &client_id,
+                "Sendspin VST Handshake Test",
+            )
+            .await
+        });
         if let Err(err) = result {
             panic!("ProtocolClient::connect failed: {err}");
         }
