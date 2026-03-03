@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use nih_plug::prelude::*;
-use nih_plug_egui::{create_egui_editor, egui, EguiState};
+use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
 use parking_lot::{Mutex, RwLock};
 use rtrb::{Consumer, Producer, RingBuffer};
 use sendspin::protocol::client::{AudioChunk, WsSender};
@@ -32,6 +32,9 @@ const CHUNK_QUEUE_CAPACITY: usize = 512;
 const TIMING_JITTER_TOLERANCE_US: i64 = 1_000;
 const RENDER_CLOCK_REANCHOR_THRESHOLD_US: i64 = 250_000;
 const PREFERRED_PCM_BIT_DEPTH: u8 = 24;
+const PIPELINE_OFFSET_MIN_MS: i32 = -100;
+const PIPELINE_OFFSET_MAX_MS: i32 = 200;
+const PIPELINE_OFFSET_STEP_MS: i32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -320,8 +323,8 @@ impl Default for SendspinVst3Params {
                 "Pipeline Offset (ms)",
                 0,
                 IntRange::Linear {
-                    min: -100,
-                    max: 200,
+                    min: PIPELINE_OFFSET_MIN_MS,
+                    max: PIPELINE_OFFSET_MAX_MS,
                 },
             )
             .with_unit(" ms"),
@@ -561,7 +564,7 @@ impl Plugin for SendspinVst3 {
             Arc::clone(&self.params.editor_state),
             EditorUiState::default(),
             |_, _| {},
-            move |egui_ctx, _setter, state| {
+            move |egui_ctx, setter, state| {
                 let discovered_servers = shared.discovered_servers();
                 let configured_url = shared.configured_server_url();
                 let configured_client_name = shared.configured_client_name();
@@ -591,6 +594,38 @@ impl Plugin for SendspinVst3 {
                     ));
                     ui.label(format!("Client Name: {}", configured_client_name));
                     ui.label(format!("Server URL: {}", configured_url));
+                    ui.horizontal(|ui| {
+                        ui.label("Sync delay trim:");
+                        if ui.small_button("<").clicked() {
+                            let current = params.pipeline_offset_ms.value();
+                            let stepped = (current - PIPELINE_OFFSET_STEP_MS)
+                                .clamp(PIPELINE_OFFSET_MIN_MS, PIPELINE_OFFSET_MAX_MS);
+                            if stepped != current {
+                                setter.begin_set_parameter(&params.pipeline_offset_ms);
+                                setter.set_parameter(&params.pipeline_offset_ms, stepped);
+                                setter.end_set_parameter(&params.pipeline_offset_ms);
+                            }
+                        }
+                        if ui.small_button(">").clicked() {
+                            let current = params.pipeline_offset_ms.value();
+                            let stepped = (current + PIPELINE_OFFSET_STEP_MS)
+                                .clamp(PIPELINE_OFFSET_MIN_MS, PIPELINE_OFFSET_MAX_MS);
+                            if stepped != current {
+                                setter.begin_set_parameter(&params.pipeline_offset_ms);
+                                setter.set_parameter(&params.pipeline_offset_ms, stepped);
+                                setter.end_set_parameter(&params.pipeline_offset_ms);
+                            }
+                        }
+                        ui.label(format!("{} ms", params.pipeline_offset_ms.value()));
+                    });
+                    ui.label(
+                        "Latency compensation: use negative values to make audio earlier, \
+                         positive values to add delay.",
+                    );
+                    ui.add(
+                        widgets::ParamSlider::for_param(&params.pipeline_offset_ms, setter)
+                            .with_width(220.0),
+                    );
                     ui.separator();
 
                     ui.horizontal(|ui| {
