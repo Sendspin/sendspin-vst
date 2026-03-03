@@ -2,6 +2,10 @@
 
 Experimental Sendspin `player@v1` VST3 plugin implemented in Rust.
 
+## UI Preview
+
+![TouchDesigner plugin screenshot](assets/touchdesigner-screenshot.png)
+
 ## Current scope
 
 - VST3 instrument plugin with stereo output
