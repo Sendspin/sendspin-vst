@@ -20,7 +20,7 @@ nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 parking_lot = "0.12"
 rtrb = "0.3"
-sendspin = { git = "https://github.com/Sendspin/sendspin-rs.git" }
+sendspin = "0.1.1"
 tokio = { version = "1.40", features = ["rt", "sync", "time"] }
 url = "2.5"
 uuid = { version = "1.10", features = ["v4"] }
