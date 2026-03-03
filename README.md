@@ -64,6 +64,6 @@ The bundle will be written to:
 
 ## Release Builds
 
-- GitHub Actions builds both macOS and Windows `.vst3` bundles on tag pushes (`v*`)
+- GitHub Actions builds both macOS and Windows `.vst3` bundles when a GitHub Release is published
 - Both zip assets are attached to the GitHub release
-- Plugin version metadata is set from the tag (for example `v0.2.1` -> plugin version `0.2.1`)
+- Plugin version metadata is set from the release tag (for example `0.2.1` -> plugin version `0.2.1`)

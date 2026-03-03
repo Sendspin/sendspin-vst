@@ -1,13 +1,15 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+  release:
+    types:
+      - published
 
 permissions:
   contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name }}
 
 jobs:
   build-macos-vst3:
@@ -21,8 +23,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set Build Version From Tag
-        if: startsWith(github.ref, 'refs/tags/')
-        run: echo "SENDSPIN_BUILD_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+        run: echo "SENDSPIN_BUILD_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
 
       - name: Cache Cargo
         uses: actions/cache@v4
@@ -41,13 +42,13 @@ jobs:
       - name: Package Bundle
         run: |
           cd target/bundled
-          ditto -c -k --sequesterRsrc --keepParent "Sendspin VST3.vst3" "Sendspin-VST3-${GITHUB_REF_NAME}-macos.zip"
+          ditto -c -k --sequesterRsrc --keepParent "Sendspin VST3.vst3" "Sendspin-VST3-${RELEASE_TAG}-macos.zip"
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
           name: sendspin-vst3-macos
-          path: target/bundled/Sendspin-VST3-${{ github.ref_name }}-macos.zip
+          path: target/bundled/Sendspin-VST3-${{ env.RELEASE_TAG }}-macos.zip
 
   build-windows-vst3:
     runs-on: windows-latest
@@ -60,10 +61,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set Build Version From Tag
-        if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         run: |
-          $version = $env:GITHUB_REF_NAME
+          $version = $env:RELEASE_TAG
           if ($version.StartsWith("v")) { $version = $version.Substring(1) }
           "SENDSPIN_BUILD_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
@@ -84,7 +84,7 @@ jobs:
       - name: Package Bundle
         shell: pwsh
         run: |
-          $zipPath = "target/bundled/Sendspin-VST3-$env:GITHUB_REF_NAME-windows.zip"
+          $zipPath = "target/bundled/Sendspin-VST3-$env:RELEASE_TAG-windows.zip"
           if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
           Compress-Archive -Path "target/bundled/Sendspin VST3.vst3" -DestinationPath $zipPath
 
@@ -92,10 +92,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sendspin-vst3-windows
-          path: target/bundled/Sendspin-VST3-${{ github.ref_name }}-windows.zip
+          path: target/bundled/Sendspin-VST3-${{ env.RELEASE_TAG }}-windows.zip
 
   publish-release:
-    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     needs:
       - build-macos-vst3
@@ -117,6 +116,8 @@ jobs:
       - name: Publish Release Assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          overwrite_files: true
           files: |
-            release-assets/macos/Sendspin-VST3-${{ github.ref_name }}-macos.zip
-            release-assets/windows/Sendspin-VST3-${{ github.ref_name }}-windows.zip
+            release-assets/macos/Sendspin-VST3-${{ env.RELEASE_TAG }}-macos.zip
+            release-assets/windows/Sendspin-VST3-${{ env.RELEASE_TAG }}-windows.zip
