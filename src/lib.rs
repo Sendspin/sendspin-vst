@@ -27,7 +27,11 @@ use uuid::Uuid;
 const DEFAULT_SERVER_PATH: &str = "/sendspin";
 const SENDSPIN_SERVER_SERVICE_TYPE: &str = "_sendspin-server._tcp.local.";
 const DEFAULT_CLIENT_NAME: &str = "Sendspin VST";
-const PRODUCT_NAME: &str = "Sendspin VST3";
+const PRODUCT_NAME: &str = "Sendspin VST";
+const EFFECTIVE_PLUGIN_VERSION: &str = match option_env!("SENDSPIN_BUILD_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
 const BUFFER_CAPACITY_BYTES: u32 = 1_048_576;
 const CHUNK_QUEUE_CAPACITY: usize = 512;
 const TIMING_JITTER_TOLERANCE_US: i64 = 1_000;
@@ -596,14 +600,11 @@ fn apply_server_url_selection(
 }
 
 impl Plugin for SendspinVst3 {
-    const NAME: &'static str = "Sendspin VST3";
+    const NAME: &'static str = "Sendspin";
     const VENDOR: &'static str = "Sendspin";
     const URL: &'static str = "https://github.com/Sendspin";
     const EMAIL: &'static str = "devnull@sendspin.invalid";
-    const VERSION: &'static str = match option_env!("SENDSPIN_BUILD_VERSION") {
-        Some(version) => version,
-        None => env!("CARGO_PKG_VERSION"),
-    };
+    const VERSION: &'static str = EFFECTIVE_PLUGIN_VERSION;
 
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
         main_input_channels: None,
@@ -663,7 +664,7 @@ impl Plugin for SendspinVst3 {
                 }
 
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
-                    ui.heading("Sendspin VST3");
+                    ui.heading("Sendspin");
                     ui.label(format!("Connection: {}", connection_state.as_str()));
                     ui.label(format!("Client Name: {}", configured_client_name));
                     ui.label(format!("Server URL: {}", configured_url));
@@ -1058,7 +1059,7 @@ fn network_thread_main(
                 device_info: Some(DeviceInfo {
                     product_name: Some(PRODUCT_NAME.to_string()),
                     manufacturer: Some("Sendspin".to_string()),
-                    software_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                    software_version: Some(EFFECTIVE_PLUGIN_VERSION.to_string()),
                 }),
                 player_v1_support: Some(player_support),
                 artwork_v1_support: None,
