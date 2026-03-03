@@ -490,7 +490,10 @@ impl Plugin for SendspinVst3 {
     const VENDOR: &'static str = "Sendspin";
     const URL: &'static str = "https://github.com/Sendspin";
     const EMAIL: &'static str = "devnull@sendspin.invalid";
-    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    const VERSION: &'static str = match option_env!("SENDSPIN_BUILD_VERSION") {
+        Some(version) => version,
+        None => env!("CARGO_PKG_VERSION"),
+    };
 
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
         main_input_channels: None,

@@ -57,3 +57,9 @@ cargo xtask bundle sendspin-vst3 --release
 The bundle will be written to:
 
 - `target/bundled/Sendspin VST3.vst3`
+
+## Release Builds
+
+- GitHub Actions builds both macOS and Windows `.vst3` bundles on tag pushes (`v*`)
+- Both zip assets are attached to the GitHub release
+- Plugin version metadata is set from the tag (for example `v0.2.1` -> plugin version `0.2.1`)

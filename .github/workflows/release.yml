@@ -20,6 +20,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Set Build Version From Tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: echo "SENDSPIN_BUILD_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -45,8 +49,74 @@ jobs:
           name: sendspin-vst3-macos
           path: target/bundled/Sendspin-VST3-${{ github.ref_name }}-macos.zip
 
-      - name: Publish Release Asset
+  build-windows-vst3:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set Build Version From Tag
         if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME
+          if ($version.StartsWith("v")) { $version = $version.Substring(1) }
+          "SENDSPIN_BUILD_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build VST3 Bundle
+        run: cargo xtask bundle sendspin-vst3 --release
+
+      - name: Package Bundle
+        shell: pwsh
+        run: |
+          $zipPath = "target/bundled/Sendspin-VST3-$env:GITHUB_REF_NAME-windows.zip"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path "target/bundled/Sendspin VST3.vst3" -DestinationPath $zipPath
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sendspin-vst3-windows
+          path: target/bundled/Sendspin-VST3-${{ github.ref_name }}-windows.zip
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    needs:
+      - build-macos-vst3
+      - build-windows-vst3
+
+    steps:
+      - name: Download macOS Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sendspin-vst3-macos
+          path: release-assets/macos
+
+      - name: Download Windows Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sendspin-vst3-windows
+          path: release-assets/windows
+
+      - name: Publish Release Assets
         uses: softprops/action-gh-release@v2
         with:
-          files: target/bundled/Sendspin-VST3-${{ github.ref_name }}-macos.zip
+          files: |
+            release-assets/macos/Sendspin-VST3-${{ github.ref_name }}-macos.zip
+            release-assets/windows/Sendspin-VST3-${{ github.ref_name }}-windows.zip
