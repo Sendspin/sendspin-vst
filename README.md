@@ -33,10 +33,13 @@ URL normalization rules:
 - `https://...` becomes `wss://...`
 - host-only values are treated as `ws://<host>/sendspin`
 
-Default URL comes from:
+There is no implicit default server URL. The plugin starts disconnected until you:
 
-- `SENDSPIN_SERVER_URL` (if valid)
-- otherwise `ws://127.0.0.1:8927/sendspin`
+- select a discovered server from the GUI, or
+- enter a custom URL in the GUI.
+
+If no server URL is configured yet, the plugin will auto-select the first discovered
+Sendspin server and connect to it.
 
 Default client name comes from:
 

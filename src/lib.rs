@@ -23,7 +23,6 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use url::Url;
 use uuid::Uuid;
 
-const DEFAULT_SERVER_URL: &str = "ws://127.0.0.1:8927/sendspin";
 const DEFAULT_SERVER_PATH: &str = "/sendspin";
 const SENDSPIN_SERVER_SERVICE_TYPE: &str = "_sendspin-server._tcp.local.";
 const DEFAULT_CLIENT_NAME: &str = "Sendspin VST";
@@ -124,7 +123,7 @@ impl SharedState {
             sync_state: AtomicU8::new(SyncState::Synchronized as u8),
             connection_state: AtomicU8::new(ConnectionState::Disconnected as u8),
             state_dirty: AtomicBool::new(true),
-            configured_server_url: RwLock::new(default_server_url()),
+            configured_server_url: RwLock::new(String::new()),
             configured_client_name: RwLock::new(default_client_name()),
             discovered_servers: RwLock::new(Vec::new()),
             worker_command_tx: Mutex::new(None),
@@ -313,7 +312,7 @@ impl Default for SendspinVst3Params {
         Self {
             editor_state: EguiState::from_size(560, 320),
             client_name: Arc::new(Mutex::new(default_client_name())),
-            server_url: Arc::new(Mutex::new(default_server_url())),
+            server_url: Arc::new(Mutex::new(String::new())),
             volume: FloatParam::new("Volume", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
                 .with_unit(""),
             mute: BoolParam::new("Mute", false),
@@ -500,8 +499,10 @@ impl SendspinVst3 {
 #[derive(Debug, Default)]
 struct EditorUiState {
     client_name_input: String,
+    client_name_initialized: bool,
     use_custom_url: bool,
     custom_url_input: String,
+    custom_url_initialized: bool,
     last_message: String,
 }
 
@@ -564,11 +565,13 @@ impl Plugin for SendspinVst3 {
                 let discovered_servers = shared.discovered_servers();
                 let configured_url = shared.configured_server_url();
                 let configured_client_name = shared.configured_client_name();
-                if state.custom_url_input.is_empty() {
-                    state.custom_url_input = configured_url.clone();
-                }
-                if state.client_name_input.is_empty() {
+                if !state.client_name_initialized {
                     state.client_name_input = configured_client_name.clone();
+                    state.client_name_initialized = true;
+                }
+                if !state.custom_url_initialized {
+                    state.custom_url_input = configured_url.clone();
+                    state.custom_url_initialized = true;
                 }
 
                 if !discovered_servers
@@ -592,7 +595,9 @@ impl Plugin for SendspinVst3 {
 
                     ui.horizontal(|ui| {
                         ui.label("Client name:");
-                        ui.text_edit_singleline(&mut state.client_name_input);
+                        ui.push_id("client-name-input", |ui| {
+                            ui.text_edit_singleline(&mut state.client_name_input);
+                        });
                         if ui.button("Apply Name").clicked() {
                             match apply_client_name_selection(
                                 &params,
@@ -666,7 +671,9 @@ impl Plugin for SendspinVst3 {
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.label("Custom URL:");
-                            ui.text_edit_singleline(&mut state.custom_url_input);
+                            ui.push_id("custom-url-input", |ui| {
+                                ui.text_edit_singleline(&mut state.custom_url_input);
+                            });
                             if ui.button("Connect").clicked() {
                                 match apply_server_url_selection(
                                     &params,
@@ -722,8 +729,7 @@ impl Plugin for SendspinVst3 {
         self.shared
             .set_configured_client_name(configured_client_name);
         let saved_server_url = self.params.server_url.lock().clone();
-        let configured_server_url =
-            normalize_server_url(&saved_server_url).unwrap_or_else(default_server_url);
+        let configured_server_url = normalize_server_url(&saved_server_url).unwrap_or_default();
         *self.params.server_url.lock() = configured_server_url.clone();
         self.shared.set_configured_server_url(configured_server_url);
         self.start_mdns_worker_if_needed();
@@ -741,6 +747,15 @@ impl Plugin for SendspinVst3 {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        // Keep persisted state aligned with background auto-selection (e.g. mDNS auto-connect).
+        let configured_server_url = self.shared.configured_server_url();
+        {
+            let mut persisted_server_url = self.params.server_url.lock();
+            if *persisted_server_url != configured_server_url {
+                *persisted_server_url = configured_server_url;
+            }
+        }
+
         if self.shared.take_clear_requested() {
             self.clear_audio_queue();
         }
@@ -852,10 +867,10 @@ fn network_thread_main(
 
     runtime.block_on(async move {
         let mut reconnect_delay = Duration::from_secs(1);
-        let mut active_server_url = normalize_server_url(&server_url).unwrap_or_else(default_server_url);
+        let mut active_server_url = normalize_server_url(&server_url);
         let mut active_client_name =
             normalize_client_name(&client_name).unwrap_or_else(default_client_name);
-        shared.set_configured_server_url(active_server_url.clone());
+        shared.set_configured_server_url(active_server_url.clone().unwrap_or_default());
         shared.set_configured_client_name(active_client_name.clone());
 
         'outer: loop {
@@ -864,7 +879,7 @@ fn network_thread_main(
                     Ok(WorkerCommand::Shutdown) => break 'outer,
                     Ok(WorkerCommand::SetServerUrl(new_url)) => {
                         if let Some(normalized) = normalize_server_url(&new_url) {
-                            active_server_url = normalized.clone();
+                            active_server_url = Some(normalized.clone());
                             shared.set_configured_server_url(normalized);
                             reconnect_delay = Duration::from_millis(100);
                         }
@@ -881,6 +896,26 @@ fn network_thread_main(
                 }
             }
 
+            if active_server_url.is_none() {
+                shared.set_connection_state(ConnectionState::Disconnected);
+                match wait_reconnect_or_command(&mut command_rx, Duration::from_secs(30)).await {
+                    ReconnectAction::Stop => break,
+                    ReconnectAction::Continue => continue,
+                    ReconnectAction::UpdateServerUrl(new_url) => {
+                        active_server_url = Some(new_url.clone());
+                        shared.set_configured_server_url(new_url);
+                        reconnect_delay = Duration::from_millis(100);
+                        continue;
+                    }
+                    ReconnectAction::UpdateClientName(new_client_name) => {
+                        active_client_name = new_client_name.clone();
+                        shared.set_configured_client_name(new_client_name);
+                        reconnect_delay = Duration::from_millis(100);
+                        continue;
+                    }
+                }
+            }
+
             shared.set_connection_state(ConnectionState::Connecting);
 
             let host_sample_rate_hz = shared.host_sample_rate_hz.load(Ordering::Relaxed).max(44_100);
@@ -894,7 +929,10 @@ fn network_thread_main(
                 .player_v1_support(player_support)
                 .build();
 
-            let client = match builder.connect(&active_server_url).await {
+            let Some(connect_url) = active_server_url.as_ref() else {
+                continue;
+            };
+            let client = match builder.connect(connect_url).await {
                 Ok(client) => client,
                 Err(_) => {
                     shared.set_connection_state(ConnectionState::Error);
@@ -905,7 +943,7 @@ fn network_thread_main(
                             continue;
                         }
                         ReconnectAction::UpdateServerUrl(new_url) => {
-                            active_server_url = new_url.clone();
+                            active_server_url = Some(new_url.clone());
                             shared.set_configured_server_url(new_url);
                             reconnect_delay = Duration::from_millis(100);
                             continue;
@@ -946,8 +984,8 @@ fn network_thread_main(
                             }
                             Some(WorkerCommand::SetServerUrl(new_url)) => {
                                 if let Some(normalized) = normalize_server_url(&new_url) {
-                                    if normalized != active_server_url {
-                                        active_server_url = normalized.clone();
+                                    if active_server_url.as_ref() != Some(&normalized) {
+                                        active_server_url = Some(normalized.clone());
                                         shared.set_configured_server_url(normalized);
                                         reconnect_immediately = true;
                                         break;
@@ -1021,7 +1059,7 @@ fn network_thread_main(
                     reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(30));
                 }
                 ReconnectAction::UpdateServerUrl(new_url) => {
-                    active_server_url = new_url.clone();
+                    active_server_url = Some(new_url.clone());
                     shared.set_configured_server_url(new_url);
                     reconnect_delay = Duration::from_millis(100);
                 }
@@ -1286,16 +1324,6 @@ async fn wait_reconnect_or_command(
     }
 }
 
-fn default_server_url() -> String {
-    if let Ok(value) = std::env::var("SENDSPIN_SERVER_URL") {
-        if let Some(normalized) = normalize_server_url(&value) {
-            return normalized;
-        }
-    }
-
-    DEFAULT_SERVER_URL.to_string()
-}
-
 fn default_client_name() -> String {
     if let Ok(value) = std::env::var("SENDSPIN_CLIENT_NAME") {
         if let Some(normalized) = normalize_client_name(&value) {
@@ -1399,6 +1427,13 @@ fn mdns_thread_main(shared: Arc<SharedState>, command_rx: StdReceiver<MdnsComman
         let mut servers: Vec<DiscoveredServer> = discovered_by_id.values().cloned().collect();
         servers.sort_by(|a, b| a.name.cmp(&b.name).then(a.url.cmp(&b.url)));
         shared.set_discovered_servers(servers);
+
+        let configured_server_url = shared.configured_server_url();
+        if normalize_server_url(&configured_server_url).is_none() {
+            if let Some(first_server) = shared.discovered_servers().first() {
+                shared.request_server_switch(first_server.url.clone());
+            }
+        }
     }
 
     let _ = mdns.stop_browse(SENDSPIN_SERVER_SERVICE_TYPE);
