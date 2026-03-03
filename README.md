@@ -2,6 +2,10 @@
 
 Experimental Sendspin `player@v1` VST3 plugin implemented in Rust.
 
+## Compatibility
+
+- Requires a Music Assistant nightly build newer than March 3, 2026.
+
 ## UI Preview
 
 ![TouchDesigner plugin screenshot](assets/touchdesigner-screenshot.png)

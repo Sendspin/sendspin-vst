@@ -821,12 +821,6 @@ impl Plugin for SendspinVst3 {
                         });
                     }
 
-                    ui.separator();
-                    ui.label(format!("Discovered servers: {}", discovered_servers.len()));
-                    for entry in &discovered_servers {
-                        ui.label(format!("{}: {}", entry.name, entry.url));
-                    }
-
                     if !state.last_message.is_empty() {
                         ui.separator();
                         ui.label(state.last_message.clone());
