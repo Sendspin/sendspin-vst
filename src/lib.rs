@@ -14,10 +14,11 @@ use parking_lot::{Mutex, RwLock};
 use rtrb::{Consumer, Producer, RingBuffer};
 use sendspin::protocol::client::{AudioChunk, WsSender};
 use sendspin::protocol::messages::{
-    AudioFormatSpec, ClientGoodbye, ClientState, GoodbyeReason, Message, PlayerFormatRequest,
-    PlayerState, PlayerSyncState, PlayerV1Support, StreamRequestFormat,
+    AudioFormatSpec, ClientCommand, ClientGoodbye, ClientHello, ClientState, ControllerCommand,
+    DeviceInfo, GoodbyeReason, Message, PlayerFormatRequest, PlayerState, PlayerSyncState,
+    PlayerV1Support, StreamRequestFormat,
 };
-use sendspin::ProtocolClientBuilder;
+use sendspin::ProtocolClient;
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use url::Url;
@@ -89,6 +90,24 @@ impl ConnectionState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum GroupPlaybackState {
+    Unknown = 0,
+    Stopped = 1,
+    Playing = 2,
+}
+
+impl GroupPlaybackState {
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::Stopped,
+            2 => Self::Playing,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DiscoveredServer {
     id: String,
@@ -106,9 +125,12 @@ struct SharedState {
     remote_muted: AtomicBool,
     sync_state: AtomicU8,
     connection_state: AtomicU8,
+    group_playback_state: AtomicU8,
     state_dirty: AtomicBool,
     configured_server_url: RwLock<String>,
     configured_client_name: RwLock<String>,
+    now_playing_artist: RwLock<String>,
+    now_playing_title: RwLock<String>,
     discovered_servers: RwLock<Vec<DiscoveredServer>>,
     worker_command_tx: Mutex<Option<UnboundedSender<WorkerCommand>>>,
     mdns_command_tx: Mutex<Option<StdSender<MdnsCommand>>>,
@@ -125,9 +147,12 @@ impl SharedState {
             remote_muted: AtomicBool::new(false),
             sync_state: AtomicU8::new(SyncState::Synchronized as u8),
             connection_state: AtomicU8::new(ConnectionState::Disconnected as u8),
+            group_playback_state: AtomicU8::new(GroupPlaybackState::Unknown as u8),
             state_dirty: AtomicBool::new(true),
             configured_server_url: RwLock::new(String::new()),
             configured_client_name: RwLock::new(default_client_name()),
+            now_playing_artist: RwLock::new(String::new()),
+            now_playing_title: RwLock::new(String::new()),
             discovered_servers: RwLock::new(Vec::new()),
             worker_command_tx: Mutex::new(None),
             mdns_command_tx: Mutex::new(None),
@@ -144,6 +169,15 @@ impl SharedState {
 
     fn connection_state(&self) -> ConnectionState {
         ConnectionState::from_u8(self.connection_state.load(Ordering::Acquire))
+    }
+
+    fn set_group_playback_state(&self, state: GroupPlaybackState) {
+        self.group_playback_state
+            .store(state as u8, Ordering::Relaxed);
+    }
+
+    fn group_playback_state(&self) -> GroupPlaybackState {
+        GroupPlaybackState::from_u8(self.group_playback_state.load(Ordering::Acquire))
     }
 
     fn request_clear(&self) {
@@ -189,6 +223,29 @@ impl SharedState {
         self.configured_client_name.read().clone()
     }
 
+    fn set_now_playing(&self, artist: Option<&str>, title: Option<&str>) {
+        let artist_value = artist
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default()
+            .to_string();
+        let title_value = title
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default()
+            .to_string();
+
+        *self.now_playing_artist.write() = artist_value;
+        *self.now_playing_title.write() = title_value;
+    }
+
+    fn now_playing(&self) -> (String, String) {
+        (
+            self.now_playing_artist.read().clone(),
+            self.now_playing_title.read().clone(),
+        )
+    }
+
     fn set_discovered_servers(&self, servers: Vec<DiscoveredServer>) {
         *self.discovered_servers.write() = servers;
     }
@@ -216,6 +273,12 @@ impl SharedState {
         self.set_configured_client_name(client_name.clone());
         if let Some(tx) = self.worker_command_tx.lock().as_ref() {
             let _ = tx.send(WorkerCommand::SetClientName(client_name));
+        }
+    }
+
+    fn request_controller_command(&self, command: String) {
+        if let Some(tx) = self.worker_command_tx.lock().as_ref() {
+            let _ = tx.send(WorkerCommand::SendControllerCommand(command));
         }
     }
 
@@ -254,6 +317,7 @@ enum WorkerCommand {
     Shutdown,
     SetServerUrl(String),
     SetClientName(String),
+    SendControllerCommand(String),
 }
 
 enum MdnsCommand {
@@ -568,6 +632,18 @@ impl Plugin for SendspinVst3 {
                 let discovered_servers = shared.discovered_servers();
                 let configured_url = shared.configured_server_url();
                 let configured_client_name = shared.configured_client_name();
+                let connection_state = shared.connection_state();
+                let playback_state = shared.group_playback_state();
+                let (now_playing_artist, now_playing_title) = shared.now_playing();
+                let now_playing_label =
+                    match (now_playing_artist.is_empty(), now_playing_title.is_empty()) {
+                        (true, true) => "Now playing: (metadata unavailable)".to_string(),
+                        (false, true) => format!("Now playing: {now_playing_artist}"),
+                        (true, false) => format!("Now playing: {now_playing_title}"),
+                        (false, false) => {
+                            format!("Now playing: {now_playing_artist} - {now_playing_title}")
+                        }
+                    };
                 if !state.client_name_initialized {
                     state.client_name_input = configured_client_name.clone();
                     state.client_name_initialized = true;
@@ -588,12 +664,29 @@ impl Plugin for SendspinVst3 {
 
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
                     ui.heading("Sendspin VST3");
-                    ui.label(format!(
-                        "Connection: {}",
-                        shared.connection_state().as_str()
-                    ));
+                    ui.label(format!("Connection: {}", connection_state.as_str()));
                     ui.label(format!("Client Name: {}", configured_client_name));
                     ui.label(format!("Server URL: {}", configured_url));
+                    ui.horizontal_wrapped(|ui| {
+                        let toggle_label = if playback_state == GroupPlaybackState::Playing {
+                            "Pause"
+                        } else {
+                            "Play"
+                        };
+                        let command = if playback_state == GroupPlaybackState::Playing {
+                            "pause"
+                        } else {
+                            "play"
+                        };
+                        if ui.button(toggle_label).clicked() {
+                            shared.request_controller_command(command.to_string());
+                            state.last_message = format!("Sent '{command}' command.");
+                        }
+                        ui.label(now_playing_label);
+                    });
+                    ui.label(
+                        "Play/Pause sends controller commands to the connected Sendspin server.",
+                    );
                     ui.horizontal(|ui| {
                         ui.label("Sync delay trim:");
                         if ui.small_button("<").clicked() {
@@ -926,6 +1019,7 @@ fn network_thread_main(
                             reconnect_delay = Duration::from_millis(100);
                         }
                     }
+                    Ok(WorkerCommand::SendControllerCommand(_)) => {}
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break 'outer,
                 }
@@ -933,6 +1027,7 @@ fn network_thread_main(
 
             if active_server_url.is_none() {
                 shared.set_connection_state(ConnectionState::Disconnected);
+                shared.set_now_playing(None, None);
                 match wait_reconnect_or_command(&mut command_rx, Duration::from_secs(30)).await {
                     ReconnectAction::Stop => break,
                     ReconnectAction::Continue => continue,
@@ -952,22 +1047,34 @@ fn network_thread_main(
             }
 
             shared.set_connection_state(ConnectionState::Connecting);
+            shared.set_group_playback_state(GroupPlaybackState::Unknown);
+            shared.set_now_playing(None, None);
 
             let host_sample_rate_hz = shared.host_sample_rate_hz.load(Ordering::Relaxed).max(44_100);
             let player_support = build_player_support(host_sample_rate_hz);
-
-            let builder = ProtocolClientBuilder::builder()
-                .client_id(client_id.clone())
-                .name(active_client_name.clone())
-                .product_name(Some(PRODUCT_NAME.to_string()))
-                .software_version(Some(env!("CARGO_PKG_VERSION").to_string()))
-                .player_v1_support(player_support)
-                .build();
+            let hello = ClientHello {
+                client_id: client_id.clone(),
+                name: active_client_name.clone(),
+                version: 1,
+                supported_roles: vec![
+                    "player@v1".to_string(),
+                    "controller@v1".to_string(),
+                    "metadata@v1".to_string(),
+                ],
+                device_info: Some(DeviceInfo {
+                    product_name: Some(PRODUCT_NAME.to_string()),
+                    manufacturer: Some("Sendspin".to_string()),
+                    software_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                }),
+                player_v1_support: Some(player_support),
+                artwork_v1_support: None,
+                visualizer_v1_support: None,
+            };
 
             let Some(connect_url) = active_server_url.as_ref() else {
                 continue;
             };
-            let client = match builder.connect(connect_url).await {
+            let client = match ProtocolClient::connect(connect_url, hello).await {
                 Ok(client) => client,
                 Err(_) => {
                     shared.set_connection_state(ConnectionState::Error);
@@ -1020,6 +1127,7 @@ fn network_thread_main(
                             Some(WorkerCommand::SetServerUrl(new_url)) => {
                                 if let Some(normalized) = normalize_server_url(&new_url) {
                                     if active_server_url.as_ref() != Some(&normalized) {
+                                        let _ = send_goodbye(&ws_tx, GoodbyeReason::Restart).await;
                                         active_server_url = Some(normalized.clone());
                                         shared.set_configured_server_url(normalized);
                                         reconnect_immediately = true;
@@ -1030,12 +1138,16 @@ fn network_thread_main(
                             Some(WorkerCommand::SetClientName(new_client_name)) => {
                                 if let Some(normalized) = normalize_client_name(&new_client_name) {
                                     if normalized != active_client_name {
+                                        let _ = send_goodbye(&ws_tx, GoodbyeReason::Restart).await;
                                         active_client_name = normalized.clone();
                                         shared.set_configured_client_name(normalized);
                                         reconnect_immediately = true;
                                         break;
                                     }
                                 }
+                            }
+                            Some(WorkerCommand::SendControllerCommand(command)) => {
+                                let _ = send_controller_command(&ws_tx, &command).await;
                             }
                             None => {
                                 reconnect = false;
@@ -1076,6 +1188,8 @@ fn network_thread_main(
             }
 
             shared.set_connection_state(ConnectionState::Disconnected);
+            shared.set_group_playback_state(GroupPlaybackState::Unknown);
+            shared.set_now_playing(None, None);
             shared.set_stream_active(false);
             shared.request_clear();
 
@@ -1144,6 +1258,7 @@ async fn handle_message(
             });
 
             shared.set_stream_active(true);
+            shared.set_group_playback_state(GroupPlaybackState::Playing);
             shared.request_clear();
             shared.set_sync_state(SyncState::Synchronized);
         }
@@ -1154,8 +1269,27 @@ async fn handle_message(
         Message::StreamEnd(_) => {
             *active_stream = None;
             shared.set_stream_active(false);
+            shared.set_group_playback_state(GroupPlaybackState::Stopped);
             shared.request_clear();
             shared.set_sync_state(SyncState::Synchronized);
+        }
+        Message::ServerState(server_state) => {
+            if let Some(metadata) = server_state.metadata {
+                shared.set_now_playing(metadata.artist.as_deref(), metadata.title.as_deref());
+            }
+        }
+        Message::GroupUpdate(group_update) => {
+            if let Some(playback_state) = group_update.playback_state {
+                let mapped_state = match playback_state {
+                    sendspin::protocol::messages::PlaybackState::Playing => {
+                        GroupPlaybackState::Playing
+                    }
+                    sendspin::protocol::messages::PlaybackState::Stopped => {
+                        GroupPlaybackState::Stopped
+                    }
+                };
+                shared.set_group_playback_state(mapped_state);
+            }
         }
         Message::ServerCommand(server_command) => {
             if let Some(player_command) = server_command.player {
@@ -1317,6 +1451,21 @@ async fn send_client_state(
     ws_tx.send_message(message).await
 }
 
+async fn send_controller_command(
+    ws_tx: &WsSender,
+    command: &str,
+) -> Result<(), sendspin::error::Error> {
+    let message = Message::ClientCommand(ClientCommand {
+        controller: Some(ControllerCommand {
+            command: command.to_string(),
+            volume: None,
+            mute: None,
+        }),
+    });
+
+    ws_tx.send_message(message).await
+}
+
 async fn send_goodbye(
     ws_tx: &WsSender,
     reason: GoodbyeReason,
@@ -1354,6 +1503,7 @@ async fn wait_reconnect_or_command(
                         None => ReconnectAction::Continue,
                     }
                 }
+                Some(WorkerCommand::SendControllerCommand(_)) => ReconnectAction::Continue,
             }
         }
     }
