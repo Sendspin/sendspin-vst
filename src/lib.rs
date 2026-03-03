@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
@@ -35,6 +35,31 @@ struct ActiveChunk {
     chunk: TimestampedChunk,
     next_frame_index: usize,
     started: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TimeAnchor {
+    instant: Instant,
+    unix_micros: i64,
+}
+
+impl TimeAnchor {
+    fn capture_now() -> Self {
+        Self {
+            instant: Instant::now(),
+            unix_micros: unix_time_micros(),
+        }
+    }
+
+    fn instant_to_unix_micros(self, instant: Instant) -> i64 {
+        if instant >= self.instant {
+            let delta = instant.duration_since(self.instant).as_micros() as i64;
+            self.unix_micros.saturating_add(delta)
+        } else {
+            let delta = self.instant.duration_since(instant).as_micros() as i64;
+            self.unix_micros.saturating_sub(delta)
+        }
+    }
 }
 
 #[derive(Params)]
@@ -90,6 +115,7 @@ pub struct SendspinVst3 {
     mdns_worker: Option<MdnsWorker>,
     sample_rate_hz: u32,
     render_cursor_us: Option<i64>,
+    time_anchor: TimeAnchor,
 }
 
 impl Default for SendspinVst3 {
@@ -106,6 +132,7 @@ impl Default for SendspinVst3 {
             mdns_worker: None,
             sample_rate_hz: 48_000,
             render_cursor_us: None,
+            time_anchor: TimeAnchor::capture_now(),
         }
     }
 }
@@ -307,6 +334,18 @@ impl Plugin for SendspinVst3 {
                 let discovered_servers = shared.discovered_servers();
                 let configured_url = shared.configured_server_url();
                 let configured_client_name = shared.configured_client_name();
+                {
+                    let mut persisted_server_url = params.server_url.lock();
+                    if *persisted_server_url != configured_url {
+                        *persisted_server_url = configured_url.clone();
+                    }
+                }
+                {
+                    let mut persisted_client_name = params.client_name.lock();
+                    if *persisted_client_name != configured_client_name {
+                        *persisted_client_name = configured_client_name.clone();
+                    }
+                }
                 let connection_state = shared.connection_state();
                 let playback_state = shared.group_playback_state();
                 let (now_playing_artist, now_playing_title) = shared.now_playing();
@@ -519,6 +558,7 @@ impl Plugin for SendspinVst3 {
             .host_block_size
             .store(buffer_config.max_buffer_size, Ordering::Relaxed);
         self.render_cursor_us = None;
+        self.time_anchor = TimeAnchor::capture_now();
         let saved_client_name = self.params.client_name.lock().clone();
         let configured_client_name =
             normalize_client_name(&saved_client_name).unwrap_or_else(default_client_name);
@@ -544,15 +584,6 @@ impl Plugin for SendspinVst3 {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        // Keep persisted state aligned with background auto-selection (e.g. mDNS auto-connect).
-        let configured_server_url = self.shared.configured_server_url();
-        {
-            let mut persisted_server_url = self.params.server_url.lock();
-            if *persisted_server_url != configured_server_url {
-                *persisted_server_url = configured_server_url;
-            }
-        }
-
         if self.shared.take_clear_requested() {
             self.clear_audio_queue();
         }
@@ -568,8 +599,14 @@ impl Plugin for SendspinVst3 {
 
         let block_latency_us =
             ((buffer.samples() as i64) * 1_000_000) / i64::from(host_sample_rate_hz);
-        let block_start_from_wall =
-            unix_time_micros().saturating_add(block_latency_us + user_offset_us);
+        let callback_instant = Instant::now();
+        let callback_with_offset = shift_instant_by_micros(
+            callback_instant,
+            block_latency_us.saturating_add(user_offset_us),
+        );
+        let block_start_from_wall = self
+            .time_anchor
+            .instant_to_unix_micros(callback_with_offset);
         let block_duration_us =
             ((buffer.samples() as i64) * 1_000_000) / i64::from(host_sample_rate_hz);
         let had_render_cursor = self.render_cursor_us.is_some();
@@ -644,6 +681,15 @@ impl Vst3Plugin for SendspinVst3 {
 }
 
 nih_export_vst3!(SendspinVst3);
+
+fn shift_instant_by_micros(base: Instant, delta_us: i64) -> Instant {
+    if delta_us >= 0 {
+        base + Duration::from_micros(delta_us as u64)
+    } else {
+        base.checked_sub(Duration::from_micros((-delta_us) as u64))
+            .unwrap_or(base)
+    }
+}
 
 fn unix_time_micros() -> i64 {
     let Ok(duration_since_epoch) = SystemTime::now().duration_since(UNIX_EPOCH) else {
