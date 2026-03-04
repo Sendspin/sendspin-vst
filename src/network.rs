@@ -354,7 +354,7 @@ async fn handle_message(
         }
         Message::ServerState(server_state) => {
             if let Some(metadata) = server_state.metadata {
-                shared.set_now_playing(metadata.artist.as_deref(), metadata.title.as_deref());
+                shared.update_now_playing(metadata.artist.as_deref(), metadata.title.as_deref());
             }
         }
         Message::GroupUpdate(group_update) => {

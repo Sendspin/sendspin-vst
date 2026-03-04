@@ -208,19 +208,20 @@ impl SharedState {
     }
 
     pub(crate) fn set_now_playing(&self, artist: Option<&str>, title: Option<&str>) {
-        let artist_value = artist
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_default()
-            .to_string();
-        let title_value = title
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_default()
-            .to_string();
+        let artist_value = artist.map_or_else(String::new, normalize_now_playing_value);
+        let title_value = title.map_or_else(String::new, normalize_now_playing_value);
 
         *self.now_playing_artist.write() = artist_value;
         *self.now_playing_title.write() = title_value;
+    }
+
+    pub(crate) fn update_now_playing(&self, artist: Option<&str>, title: Option<&str>) {
+        if let Some(artist_value) = artist.map(normalize_now_playing_value) {
+            *self.now_playing_artist.write() = artist_value;
+        }
+        if let Some(title_value) = title.map(normalize_now_playing_value) {
+            *self.now_playing_title.write() = title_value;
+        }
     }
 
     pub(crate) fn now_playing(&self) -> (String, String) {
@@ -322,6 +323,10 @@ pub(crate) enum MdnsCommand {
     Refresh,
 }
 
+fn normalize_now_playing_value(value: &str) -> String {
+    value.trim().to_string()
+}
+
 pub(crate) struct NetworkWorker {
     command_tx: UnboundedSender<WorkerCommand>,
     join_handle: Option<thread::JoinHandle<()>>,
@@ -393,5 +398,31 @@ mod tests {
         assert_eq!(SyncState::from_u8(0), SyncState::Synchronized);
         assert_eq!(SyncState::from_u8(99), SyncState::Synchronized);
         assert_eq!(SyncState::from_u8(1), SyncState::Error);
+    }
+
+    #[test]
+    fn update_now_playing_preserves_omitted_fields() {
+        let shared = SharedState::new();
+        shared.set_now_playing(Some("Initial Artist"), Some("Initial Title"));
+
+        shared.update_now_playing(None, Some("Updated Title"));
+
+        assert_eq!(
+            shared.now_playing(),
+            ("Initial Artist".to_string(), "Updated Title".to_string())
+        );
+    }
+
+    #[test]
+    fn update_now_playing_trims_and_clears_when_explicitly_empty() {
+        let shared = SharedState::new();
+        shared.set_now_playing(Some("Artist"), Some("Title"));
+
+        shared.update_now_playing(Some("  "), Some("  New Title  "));
+
+        assert_eq!(
+            shared.now_playing(),
+            ("".to_string(), "New Title".to_string())
+        );
     }
 }
