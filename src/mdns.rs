@@ -6,7 +6,7 @@ use mdns_sd::{ServiceDaemon, ServiceEvent};
 
 use crate::config::normalize_server_url;
 use crate::constants::{DEFAULT_SERVER_PATH, SENDSPIN_SERVER_SERVICE_TYPE};
-use crate::state::{DiscoveredServer, MdnsCommand, SharedState};
+use crate::state::{ConnectionState, DiscoveredServer, MdnsCommand, SharedState};
 
 pub(crate) fn mdns_thread_main(shared: Arc<SharedState>, command_rx: StdReceiver<MdnsCommand>) {
     let Ok(mdns) = ServiceDaemon::new() else {
@@ -61,9 +61,16 @@ pub(crate) fn mdns_thread_main(shared: Arc<SharedState>, command_rx: StdReceiver
         shared.set_discovered_servers(servers.clone());
 
         let configured_server_url = shared.configured_server_url();
-        if normalize_server_url(&configured_server_url).is_none() {
-            if let Some(first_server) = servers.first() {
-                shared.request_server_switch(first_server.url.clone());
+        let configured_server_url =
+            normalize_server_url(&configured_server_url).unwrap_or_default();
+        let should_auto_switch = shared.connection_state() != ConnectionState::Connected;
+        if should_auto_switch {
+            if let Some(desired_server_url) =
+                auto_selected_server_url(&configured_server_url, &servers)
+            {
+                if configured_server_url != desired_server_url {
+                    shared.request_server_switch(desired_server_url);
+                }
             }
         }
     }
@@ -110,4 +117,67 @@ fn discovered_server_from_mdns(info: &mdns_sd::ServiceInfo) -> Option<Discovered
         name,
         url,
     })
+}
+
+fn auto_selected_server_url(
+    configured_server_url: &str,
+    discovered_servers: &[DiscoveredServer],
+) -> Option<String> {
+    if discovered_servers.is_empty() {
+        return None;
+    }
+
+    let normalized_configured = normalize_server_url(configured_server_url);
+    if let Some(preferred_url) = normalized_configured {
+        if discovered_servers
+            .iter()
+            .any(|entry| entry.url == preferred_url)
+        {
+            return Some(preferred_url);
+        }
+    }
+
+    discovered_servers.first().map(|entry| entry.url.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auto_selected_server_url;
+    use crate::state::DiscoveredServer;
+
+    fn server(id: &str, name: &str, url: &str) -> DiscoveredServer {
+        DiscoveredServer {
+            id: id.to_string(),
+            name: name.to_string(),
+            url: url.to_string(),
+        }
+    }
+
+    #[test]
+    fn auto_select_prefers_configured_server_when_available() {
+        let servers = vec![
+            server("1", "A", "ws://a.local:8927/sendspin"),
+            server("2", "B", "ws://b.local:8927/sendspin"),
+        ];
+
+        let selected = auto_selected_server_url("ws://b.local:8927/sendspin", &servers);
+        assert_eq!(selected.as_deref(), Some("ws://b.local:8927/sendspin"));
+    }
+
+    #[test]
+    fn auto_select_falls_back_to_first_discovered_server() {
+        let servers = vec![
+            server("1", "A", "ws://a.local:8927/sendspin"),
+            server("2", "B", "ws://b.local:8927/sendspin"),
+        ];
+
+        let selected = auto_selected_server_url("ws://missing.local:8927/sendspin", &servers);
+        assert_eq!(selected.as_deref(), Some("ws://a.local:8927/sendspin"));
+    }
+
+    #[test]
+    fn auto_select_returns_none_when_no_servers() {
+        let selected = auto_selected_server_url("ws://a.local:8927/sendspin", &[]);
+        assert!(selected.is_none());
+    }
 }

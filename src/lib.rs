@@ -28,7 +28,8 @@ use constants::{
 use mdns::mdns_thread_main;
 use network::network_thread_main;
 use state::{
-    GroupPlaybackState, MdnsWorker, NetworkWorker, SharedState, SyncState, TimestampedChunk,
+    ConnectionState, DiscoveredServer, GroupPlaybackState, MdnsWorker, NetworkWorker, SharedState,
+    SyncState, TimestampedChunk,
 };
 
 #[derive(Debug)]
@@ -341,6 +342,28 @@ fn apply_server_url_selection(
     Ok(normalized)
 }
 
+fn preferred_connect_url(
+    configured_url: &str,
+    discovered_servers: &[DiscoveredServer],
+    custom_url_input: &str,
+) -> Option<String> {
+    let normalized_configured = normalize_server_url(configured_url);
+    if let Some(preferred) = normalized_configured.as_ref() {
+        if discovered_servers
+            .iter()
+            .any(|entry| entry.url == *preferred)
+        {
+            return Some(preferred.clone());
+        }
+    }
+
+    if let Some(first) = discovered_servers.first() {
+        return Some(first.url.clone());
+    }
+
+    normalized_configured.or_else(|| normalize_server_url(custom_url_input))
+}
+
 impl Plugin for SendspinVst3 {
     const NAME: &'static str = "Sendspin";
     const VENDOR: &'static str = "Sendspin";
@@ -421,7 +444,6 @@ impl Plugin for SendspinVst3 {
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
                     ui.heading("Sendspin");
                     ui.label(format!("Connection: {}", connection_state.as_str()));
-                    ui.label(format!("Client Name: {}", configured_client_name));
                     ui.label(format!("Server URL: {}", configured_url));
                     ui.label(format!(
                         "Diagnostics: queue_overflow={} decode_error={} late_chunk={}",
@@ -441,14 +463,50 @@ impl Plugin for SendspinVst3 {
                             "play"
                         };
                         if ui.button(toggle_label).clicked() {
-                            shared.request_controller_command(command.to_string());
-                            state.last_message = format!("Sent '{command}' command.");
+                            let mut should_send_command = true;
+                            if command == "play" && connection_state != ConnectionState::Connected {
+                                if let Some(connect_url) = preferred_connect_url(
+                                    &configured_url,
+                                    &discovered_servers,
+                                    &state.custom_url_input,
+                                ) {
+                                    match apply_server_url_selection(&params, &shared, &connect_url)
+                                    {
+                                        Ok(applied_url) => {
+                                            state.custom_url_input = applied_url.clone();
+                                            state.use_custom_url = !discovered_servers
+                                                .iter()
+                                                .any(|entry| entry.url == applied_url);
+                                            state.last_message =
+                                                "Connecting to server...".to_string();
+                                        }
+                                        Err(err) => {
+                                            state.last_message = err.to_string();
+                                            should_send_command = false;
+                                        }
+                                    }
+                                } else {
+                                    state.last_message =
+                                        "No server available to connect.".to_string();
+                                    should_send_command = false;
+                                }
+                            }
+
+                            if should_send_command {
+                                shared.request_controller_command(command.to_string());
+                                if command == "play"
+                                    && connection_state != ConnectionState::Connected
+                                {
+                                    state.last_message =
+                                        "Connecting and sending 'play' command.".to_string();
+                                } else {
+                                    state.last_message = format!("Sent '{command}' command.");
+                                }
+                            }
                         }
                         ui.label(now_playing_label);
                     });
-                    ui.label(
-                        "Play/Pause sends controller commands to the connected Sendspin server.",
-                    );
+                    ui.separator();
                     ui.horizontal(|ui| {
                         ui.label("Sync delay trim:");
                         if ui.small_button("<").clicked() {
@@ -461,6 +519,10 @@ impl Plugin for SendspinVst3 {
                                 setter.end_set_parameter(&params.pipeline_offset_ms);
                             }
                         }
+                        ui.add(
+                            widgets::ParamSlider::for_param(&params.pipeline_offset_ms, setter)
+                                .with_width(220.0),
+                        );
                         if ui.small_button(">").clicked() {
                             let current = params.pipeline_offset_ms.value();
                             let stepped = (current + PIPELINE_OFFSET_STEP_MS)
@@ -476,10 +538,6 @@ impl Plugin for SendspinVst3 {
                     ui.label(
                         "Latency compensation: use negative values to make audio earlier, \
                          positive values to add delay.",
-                    );
-                    ui.add(
-                        widgets::ParamSlider::for_param(&params.pipeline_offset_ms, setter)
-                            .with_width(220.0),
                     );
                     ui.separator();
 

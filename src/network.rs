@@ -44,6 +44,7 @@ pub(crate) fn network_thread_main(
         let mut active_server_url = normalize_server_url(&server_url);
         let mut active_client_name =
             normalize_client_name(&client_name).unwrap_or_else(default_client_name);
+        let mut pending_controller_command: Option<String> = None;
         shared.set_configured_server_url(active_server_url.clone().unwrap_or_default());
         shared.set_configured_client_name(active_client_name.clone());
 
@@ -65,7 +66,9 @@ pub(crate) fn network_thread_main(
                             reconnect_delay = Duration::from_millis(100);
                         }
                     }
-                    Ok(WorkerCommand::SendControllerCommand(_)) => {}
+                    Ok(WorkerCommand::SendControllerCommand(command)) => {
+                        pending_controller_command = Some(command);
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => break 'outer,
                 }
@@ -89,6 +92,10 @@ pub(crate) fn network_thread_main(
                         reconnect_delay = Duration::from_millis(100);
                         continue;
                     }
+                    ReconnectAction::QueueControllerCommand(command) => {
+                        pending_controller_command = Some(command);
+                        continue;
+                    }
                 }
             }
 
@@ -98,17 +105,12 @@ pub(crate) fn network_thread_main(
 
             let host_sample_rate_hz = shared.host_sample_rate_hz.load(Ordering::Relaxed).max(44_100);
             let player_support = build_player_support(host_sample_rate_hz);
-            let hello = build_client_hello(
-                &client_id,
-                &active_client_name,
-                player_support,
-                ClientRoleMode::Extended,
-            );
+            let hello = build_client_hello(&client_id, &active_client_name, player_support);
 
             let Some(connect_url) = active_server_url.as_ref() else {
                 continue;
             };
-            let client = match connect_with_fallback(connect_url, hello, &client_id, &active_client_name).await {
+            let client = match ProtocolClient::connect(connect_url, hello).await {
                 Ok(client) => client,
                 Err(_) => {
                     shared.set_connection_state(ConnectionState::Error);
@@ -130,6 +132,11 @@ pub(crate) fn network_thread_main(
                             reconnect_delay = Duration::from_millis(100);
                             continue;
                         }
+                        ReconnectAction::QueueControllerCommand(command) => {
+                            pending_controller_command = Some(command);
+                            reconnect_delay = Duration::from_millis(100);
+                            continue;
+                        }
                     }
                 }
             };
@@ -145,6 +152,9 @@ pub(crate) fn network_thread_main(
             let mut last_requested_sample_rate = shared.host_sample_rate_hz.load(Ordering::Relaxed);
 
             let _ = send_client_state(&ws_tx, &shared).await;
+            if let Some(command) = pending_controller_command.take() {
+                let _ = send_controller_command(&ws_tx, &command).await;
+            }
 
             let mut reconnect = true;
             let mut reconnect_immediately = false;
@@ -256,37 +266,29 @@ pub(crate) fn network_thread_main(
                     shared.set_configured_client_name(new_client_name);
                     reconnect_delay = Duration::from_millis(100);
                 }
+                ReconnectAction::QueueControllerCommand(command) => {
+                    pending_controller_command = Some(command);
+                    reconnect_delay = Duration::from_millis(100);
+                }
             }
         }
     });
-}
-
-#[derive(Clone, Copy)]
-enum ClientRoleMode {
-    PlayerOnly,
-    Extended,
 }
 
 fn build_client_hello(
     client_id: &str,
     client_name: &str,
     player_support: PlayerV1Support,
-    role_mode: ClientRoleMode,
 ) -> ClientHello {
-    let supported_roles = match role_mode {
-        ClientRoleMode::PlayerOnly => vec!["player@v1".to_string()],
-        ClientRoleMode::Extended => vec![
-            "player@v1".to_string(),
-            "controller@v1".to_string(),
-            "metadata@v1".to_string(),
-        ],
-    };
-
     ClientHello {
         client_id: client_id.to_string(),
         name: client_name.to_string(),
         version: 1,
-        supported_roles,
+        supported_roles: vec![
+            "player@v1".to_string(),
+            "controller@v1".to_string(),
+            "metadata@v1".to_string(),
+        ],
         device_info: Some(DeviceInfo {
             product_name: Some(PRODUCT_NAME.to_string()),
             manufacturer: Some("Sendspin".to_string()),
@@ -296,35 +298,6 @@ fn build_client_hello(
         artwork_v1_support: None,
         visualizer_v1_support: None,
     }
-}
-
-async fn connect_with_fallback(
-    connect_url: &str,
-    hello: ClientHello,
-    client_id: &str,
-    client_name: &str,
-) -> Result<ProtocolClient, sendspin::error::Error> {
-    match ProtocolClient::connect(connect_url, hello).await {
-        Ok(client) => Ok(client),
-        Err(err) => {
-            if !should_retry_with_player_only(&err) {
-                return Err(err);
-            }
-
-            let fallback_hello = build_client_hello(
-                client_id,
-                client_name,
-                build_compat_player_support(),
-                ClientRoleMode::PlayerOnly,
-            );
-            ProtocolClient::connect(connect_url, fallback_hello).await
-        }
-    }
-}
-
-fn should_retry_with_player_only(err: &sendspin::error::Error) -> bool {
-    let message = err.to_string();
-    message.contains("Expected server/hello")
 }
 
 async fn handle_message(
@@ -525,28 +498,6 @@ fn build_player_support(host_sample_rate_hz: u32) -> PlayerV1Support {
     }
 }
 
-fn build_compat_player_support() -> PlayerV1Support {
-    PlayerV1Support {
-        supported_formats: vec![
-            AudioFormatSpec {
-                codec: "pcm".to_string(),
-                channels: 2,
-                sample_rate: 48_000,
-                bit_depth: 24,
-            },
-            AudioFormatSpec {
-                codec: "pcm".to_string(),
-                channels: 2,
-                sample_rate: 48_000,
-                bit_depth: 16,
-            },
-        ],
-        // Match ProtocolClientBuilder defaults for broad server compatibility.
-        buffer_capacity: 50 * 1024 * 1024,
-        supported_commands: vec!["volume".to_string(), "mute".to_string()],
-    }
-}
-
 async fn request_pcm_format(
     ws_tx: &WsSender,
     sample_rate_hz: u32,
@@ -608,6 +559,7 @@ enum ReconnectAction {
     Stop,
     UpdateServerUrl(String),
     UpdateClientName(String),
+    QueueControllerCommand(String),
 }
 
 async fn wait_reconnect_or_command(
@@ -631,7 +583,9 @@ async fn wait_reconnect_or_command(
                         None => ReconnectAction::Continue,
                     }
                 }
-                Some(WorkerCommand::SendControllerCommand(_)) => ReconnectAction::Continue,
+                Some(WorkerCommand::SendControllerCommand(command)) => {
+                    ReconnectAction::QueueControllerCommand(command)
+                }
             }
         }
     }
@@ -657,8 +611,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        build_client_hello, build_player_support, connect_with_fallback, decode_pcm_samples,
-        network_thread_main, ClientRoleMode,
+        build_client_hello, build_player_support, decode_pcm_samples, network_thread_main,
+        ProtocolClient,
     };
     use crate::state::{ConnectionState, SharedState, TimestampedChunk, WorkerCommand};
 
@@ -740,7 +694,6 @@ mod tests {
             &client_id,
             "Sendspin VST Handshake Test",
             build_player_support(48_000),
-            ClientRoleMode::Extended,
         );
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -748,15 +701,7 @@ mod tests {
             .build()
             .expect("failed to build runtime");
 
-        let result = runtime.block_on(async {
-            connect_with_fallback(
-                &server_url,
-                hello,
-                &client_id,
-                "Sendspin VST Handshake Test",
-            )
-            .await
-        });
+        let result = runtime.block_on(async { ProtocolClient::connect(&server_url, hello).await });
         if let Err(err) = result {
             panic!("ProtocolClient::connect failed: {err}");
         }
