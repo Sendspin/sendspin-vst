@@ -37,18 +37,18 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build VST3 Bundle
-        run: cargo xtask bundle sendspin-vst3 --release
+        run: cargo xtask bundle sendspin-vst --release
 
       - name: Package Bundle
         run: |
           cd target/bundled
-          ditto -c -k --sequesterRsrc --keepParent "Sendspin VST3.vst3" "Sendspin-VST3-${RELEASE_TAG}-macos.zip"
+          ditto -c -k --sequesterRsrc --keepParent "Sendspin.vst3" "Sendspin-VST-${RELEASE_TAG}-macos.zip"
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sendspin-vst3-macos
-          path: target/bundled/Sendspin-VST3-${{ env.RELEASE_TAG }}-macos.zip
+          name: sendspin-vst-macos
+          path: target/bundled/Sendspin-VST-${{ env.RELEASE_TAG }}-macos.zip
 
   build-windows-vst3:
     runs-on: windows-latest
@@ -79,20 +79,20 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build VST3 Bundle
-        run: cargo xtask bundle sendspin-vst3 --release
+        run: cargo xtask bundle sendspin-vst --release
 
       - name: Package Bundle
         shell: pwsh
         run: |
-          $zipPath = "target/bundled/Sendspin-VST3-$env:RELEASE_TAG-windows.zip"
+          $zipPath = "target/bundled/Sendspin-VST-$env:RELEASE_TAG-windows.zip"
           if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-          Compress-Archive -Path "target/bundled/Sendspin VST3.vst3" -DestinationPath $zipPath
+          Compress-Archive -Path "target/bundled/Sendspin.vst3" -DestinationPath $zipPath
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sendspin-vst3-windows
-          path: target/bundled/Sendspin-VST3-${{ env.RELEASE_TAG }}-windows.zip
+          name: sendspin-vst-windows
+          path: target/bundled/Sendspin-VST-${{ env.RELEASE_TAG }}-windows.zip
 
   publish-release:
     runs-on: ubuntu-latest
@@ -104,13 +104,13 @@ jobs:
       - name: Download macOS Artifact
         uses: actions/download-artifact@v4
         with:
-          name: sendspin-vst3-macos
+          name: sendspin-vst-macos
           path: release-assets/macos
 
       - name: Download Windows Artifact
         uses: actions/download-artifact@v4
         with:
-          name: sendspin-vst3-windows
+          name: sendspin-vst-windows
           path: release-assets/windows
 
       - name: Publish Release Assets
@@ -119,5 +119,5 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           overwrite_files: true
           files: |
-            release-assets/macos/Sendspin-VST3-${{ env.RELEASE_TAG }}-macos.zip
-            release-assets/windows/Sendspin-VST3-${{ env.RELEASE_TAG }}-windows.zip
+            release-assets/macos/Sendspin-VST-${{ env.RELEASE_TAG }}-macos.zip
+            release-assets/windows/Sendspin-VST-${{ env.RELEASE_TAG }}-windows.zip

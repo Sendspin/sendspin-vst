@@ -69,9 +69,9 @@ To produce an actual `.vst3` bundle:
 
 ```bash
 cd sendspin-vst3
-cargo xtask bundle sendspin-vst3 --release
+cargo xtask bundle sendspin-vst --release
 ```
 
 The bundle will be written to:
 
-- `target/bundled/Sendspin VST3.vst3`
+- `target/bundled/Sendspin.vst3`

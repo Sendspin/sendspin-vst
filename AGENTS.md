@@ -7,13 +7,13 @@ Operational notes for working in `sendspin-vst3`.
 Build a distributable VST3 bundle:
 
 ```bash
-cargo xtask bundle sendspin-vst3 --release
+cargo xtask bundle sendspin-vst --release
 ```
 
 Bundle output:
 
 ```text
-target/bundled/Sendspin VST3.vst3
+target/bundled/Sendspin.vst3
 ```
 
 ## Release Flow (GitHub CLI)
