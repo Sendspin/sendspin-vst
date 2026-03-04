@@ -31,14 +31,13 @@ Server URL can be configured in the plugin GUI:
 
 A persistent `client_id` UUID is stored under your user config directory:
 
-- macOS: `~/Library/Application Support/sendspin-vst3/client_id`
-- Linux: `~/.config/sendspin-vst3/client_id`
-- Windows: `%APPDATA%\\sendspin-vst3\\client_id`
+- macOS: `~/Library/Application Support/sendspin-vst/client_id`
+- Linux: `~/.config/sendspin-vst/client_id`
+- Windows: `%APPDATA%\\sendspin-vst\\client_id`
 
 ## Build
 
 ```bash
-cd sendspin-vst3
 cargo check
 cargo build --release
 ```
@@ -46,7 +45,6 @@ cargo build --release
 ## Test
 
 ```bash
-cd sendspin-vst3
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
@@ -58,7 +56,7 @@ For live server smoke tests (ignored by default):
 cd ../sendspin-cli
 uv run sendspin serve --demo
 
-# Back in sendspin-vst3
+# Back in this repository
 SENDSPIN_SMOKE_SERVER_URL=ws://127.0.0.1:8927/sendspin \
   cargo test network::tests::live_protocol_client_connects -- --ignored --nocapture
 SENDSPIN_SMOKE_SERVER_URL=ws://127.0.0.1:8927/sendspin \
@@ -68,7 +66,6 @@ SENDSPIN_SMOKE_SERVER_URL=ws://127.0.0.1:8927/sendspin \
 To produce an actual `.vst3` bundle:
 
 ```bash
-cd sendspin-vst3
 cargo xtask bundle sendspin-vst --release
 ```
 

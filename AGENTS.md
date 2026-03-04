@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Operational notes for working in `sendspin-vst3`.
+Operational notes for working in `sendspin-vst`.
 
 ## Bundle Build
 

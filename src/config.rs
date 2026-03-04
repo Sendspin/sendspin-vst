@@ -79,12 +79,12 @@ pub(crate) fn load_or_create_client_id() -> String {
 
 fn client_id_path() -> PathBuf {
     if let Some(mut config_dir) = dirs::config_dir() {
-        config_dir.push("sendspin-vst3");
+        config_dir.push("sendspin-vst");
         config_dir.push("client_id");
         return config_dir;
     }
 
-    PathBuf::from("sendspin-vst3-client-id")
+    PathBuf::from("sendspin-vst-client-id")
 }
 
 #[cfg(test)]
